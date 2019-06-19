@@ -7,25 +7,35 @@ import android.view.*
 import com.jakewharton.rxbinding.support.v7.widget.queryTextChangeEvents
 import eu.kanade.tachiyomi.R
 import eu.kanade.tachiyomi.data.database.models.Manga
+import eu.kanade.tachiyomi.data.preference.PreferencesHelper
 import eu.kanade.tachiyomi.source.CatalogueSource
 import eu.kanade.tachiyomi.ui.base.controller.NucleusController
 import eu.kanade.tachiyomi.ui.base.controller.withFadeTransaction
+import eu.kanade.tachiyomi.ui.catalogue.browse.BrowseCatalogueController
 import eu.kanade.tachiyomi.ui.manga.MangaController
 import kotlinx.android.synthetic.main.catalogue_global_search_controller.*
+import uy.kohesive.injekt.injectLazy
 
 /**
  * This controller shows and manages the different search result in global search.
  * This controller should only handle UI actions, IO actions should be done by [CatalogueSearchPresenter]
  * [CatalogueSearchCardAdapter.OnMangaClickListener] called when manga is clicked in global search
  */
-class CatalogueSearchController(private val initialQuery: String? = null) :
-        NucleusController<CatalogueSearchPresenter>(),
-        CatalogueSearchCardAdapter.OnMangaClickListener {
+open class CatalogueSearchController(
+        protected val initialQuery: String? = null,
+        protected val extensionFilter: String? = null
+) : NucleusController<CatalogueSearchPresenter>(),
+        CatalogueSearchCardAdapter.OnMangaClickListener, CatalogueSearchAdapter.OnMoreClickListener {
+
+    /**
+     * Application preferences.
+     */
+    private val preferences: PreferencesHelper by injectLazy()
 
     /**
      * Adapter containing search results grouped by lang.
      */
-    private var adapter: CatalogueSearchAdapter? = null
+    protected var adapter: CatalogueSearchAdapter? = null
 
     /**
      * Called when controller is initialized.
@@ -60,7 +70,7 @@ class CatalogueSearchController(private val initialQuery: String? = null) :
      * @return instance of [CatalogueSearchPresenter]
      */
     override fun createPresenter(): CatalogueSearchPresenter {
-        return CatalogueSearchPresenter(initialQuery)
+        return CatalogueSearchPresenter(initialQuery, extensionFilter)
     }
 
     /**
@@ -71,6 +81,16 @@ class CatalogueSearchController(private val initialQuery: String? = null) :
     override fun onMangaClick(manga: Manga) {
         // Open MangaController.
         router.pushController(MangaController(manga, true).withFadeTransaction())
+    }
+
+    /**
+     * Called when manga in global search is long clicked.
+     *
+     * @param manga clicked item containing manga information.
+     */
+    override fun onMangaLongClick(manga: Manga) {
+        // Delegate to single click by default.
+        onMangaClick(manga)
     }
 
     /**
@@ -173,6 +193,18 @@ class CatalogueSearchController(private val initialQuery: String? = null) :
      */
     fun onMangaInitialized(source: CatalogueSource, manga: Manga) {
         getHolder(source)?.setImage(manga)
+    }
+
+    override fun onMoreClick(source: CatalogueSource) {
+        openCatalogue(source, BrowseCatalogueController(source, presenter.query))
+    }
+
+    /**
+     * Opens a catalogue with the given controller.
+     */
+    private fun openCatalogue(source: CatalogueSource, controller: BrowseCatalogueController) {
+        preferences.lastUsedCatalogueSource().set(source.id)
+        router.pushController(controller.withFadeTransaction())
     }
 
 }

@@ -1,29 +1,21 @@
 package exh.ui.lock
 
 import android.annotation.SuppressLint
-import android.os.Bundle
-import android.support.v4.hardware.fingerprint.FingerprintManagerCompat
-import android.support.v7.app.AppCompatActivity
-import android.support.v7.widget.CardView
 import android.util.TypedValue
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.widget.FrameLayout
 import com.afollestad.materialdialogs.MaterialDialog
 import com.andrognito.pinlockview.PinLockListener
 import com.github.ajalt.reprint.core.AuthenticationResult
-import com.github.ajalt.reprint.core.Reprint
 import com.github.ajalt.reprint.rxjava.RxReprint
 import com.mattprecious.swirl.SwirlView
 import eu.kanade.tachiyomi.R
 import eu.kanade.tachiyomi.data.preference.PreferencesHelper
 import eu.kanade.tachiyomi.data.preference.getOrDefault
 import eu.kanade.tachiyomi.ui.base.controller.NucleusController
-import eu.kanade.tachiyomi.ui.main.MainActivity
 import exh.util.dpToPx
 import kotlinx.android.synthetic.main.activity_lock.view.*
-import kotlinx.android.synthetic.main.main_activity.view.*
 import uy.kohesive.injekt.injectLazy
 
 class LockController : NucleusController<LockPresenter>() {
@@ -49,12 +41,12 @@ class LockController : NucleusController<LockPresenter>() {
             //Setup pin lock
             pin_lock_view.attachIndicatorDots(indicator_dots)
 
-            pin_lock_view.pinLength = prefs.lockLength().getOrDefault()
+            pin_lock_view.pinLength = prefs.eh_lockLength().getOrDefault()
             pin_lock_view.setPinLockListener(object : PinLockListener {
                 override fun onEmpty() {}
 
                 override fun onComplete(pin: String) {
-                    if (sha512(pin, prefs.lockSalt().get()!!) == prefs.lockHash().get()) {
+                    if (sha512(pin, prefs.eh_lockSalt().get()!!) == prefs.eh_lockHash().get()) {
                         //Yay!
                         closeLock()
                     } else {
@@ -82,6 +74,7 @@ class LockController : NucleusController<LockPresenter>() {
         with(view) {
             //Fingerprint
             if (presenter.useFingerprint) {
+                swirl_container.visibility = View.VISIBLE
                 swirl_container.removeAllViews()
                 val icon = SwirlView(context).apply {
                     val size = dpToPx(context, 60)
@@ -94,13 +87,13 @@ class LockController : NucleusController<LockPresenter>() {
                         val pSize = dpToPx(context, 8)
                         setPadding(pSize, pSize, pSize, pSize)
                     }
-                    val typedVal = TypedValue()
-                    activity!!.theme!!.resolveAttribute(android.R.attr.windowBackground, typedVal, true)
-                    setBackgroundColor(typedVal.data)
-                    //Disable elevation if dark theme is active
-                    if (typedVal.data == resources.getColor(R.color.backgroundDark, activity!!.theme!!))
+                    val lockColor = resolvColor(android.R.attr.windowBackground)
+                    setBackgroundColor(lockColor)
+                    val bgColor = resolvColor(android.R.attr.colorBackground)
+                    //Disable elevation if lock color is same as background color
+                    if (lockColor == bgColor)
                         this@with.swirl_container.cardElevation = 0f
-                    setState(SwirlView.State.OFF, false)
+                    setState(SwirlView.State.OFF, true)
                 }
                 swirl_container.addView(icon)
                 icon.setState(SwirlView.State.ON)
@@ -122,8 +115,16 @@ class LockController : NucleusController<LockPresenter>() {
                                 }
                             }
                         }
+            } else {
+                swirl_container.visibility = View.GONE
             }
         }
+    }
+
+    private fun resolvColor(color: Int): Int {
+        val typedVal = TypedValue()
+        activity!!.theme!!.resolveAttribute(color, typedVal, true)
+        return typedVal.data
     }
 
     override fun onDetach(view: View) {

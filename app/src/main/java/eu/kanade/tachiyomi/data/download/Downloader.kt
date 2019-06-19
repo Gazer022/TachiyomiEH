@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.data.download
 
 import android.content.Context
 import android.webkit.MimeTypeMap
+import com.elvishew.xlog.XLog
 import com.hippo.unifile.UniFile
 import com.jakewharton.rxrelay.BehaviorRelay
 import com.jakewharton.rxrelay.PublishRelay
@@ -9,22 +10,18 @@ import eu.kanade.tachiyomi.data.database.models.Chapter
 import eu.kanade.tachiyomi.data.database.models.Manga
 import eu.kanade.tachiyomi.data.download.model.Download
 import eu.kanade.tachiyomi.data.download.model.DownloadQueue
-import eu.kanade.tachiyomi.data.preference.PreferencesHelper
-import eu.kanade.tachiyomi.data.preference.getOrDefault
 import eu.kanade.tachiyomi.source.SourceManager
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.source.online.fetchAllImageUrlsFromPageList
 import eu.kanade.tachiyomi.util.*
-import kotlinx.coroutines.experimental.async
+import kotlinx.coroutines.async
 import okhttp3.Response
 import rx.Observable
 import rx.android.schedulers.AndroidSchedulers
 import rx.schedulers.Schedulers
-import rx.subjects.BehaviorSubject
 import rx.subscriptions.CompositeSubscription
 import timber.log.Timber
-import uy.kohesive.injekt.injectLazy
 
 /**
  * This class is the one in charge of downloading chapters.
@@ -38,30 +35,24 @@ import uy.kohesive.injekt.injectLazy
  * @param context the application context.
  * @param provider the downloads directory provider.
  * @param cache the downloads cache, used to add the downloads to the cache after their completion.
+ * @param sourceManager the source manager.
  */
-class Downloader(private val context: Context,
-                 private val provider: DownloadProvider,
-                 private val cache: DownloadCache) {
+class Downloader(
+        private val context: Context,
+        private val provider: DownloadProvider,
+        private val cache: DownloadCache,
+        private val sourceManager: SourceManager
+) {
 
     /**
      * Store for persisting downloads across restarts.
      */
-    private val store = DownloadStore(context)
+    private val store = DownloadStore(context, sourceManager)
 
     /**
      * Queue where active downloads are kept.
      */
     val queue = DownloadQueue(store)
-
-    /**
-     * Source manager.
-     */
-    private val sourceManager: SourceManager by injectLazy()
-
-    /**
-     * Preferences.
-     */
-    private val preferences: PreferencesHelper by injectLazy()
 
     /**
      * Notifier for the downloader state and progress.
@@ -72,11 +63,6 @@ class Downloader(private val context: Context,
      * Downloader subscriptions.
      */
     private val subscriptions = CompositeSubscription()
-
-    /**
-     * Subject to do a live update of the number of simultaneous downloads.
-     */
-    private val threadsSubject = BehaviorSubject.create<Int>()
 
     /**
      * Relay to send a list of downloads to the downloader.
@@ -115,9 +101,6 @@ class Downloader(private val context: Context,
 
         val pending = queue.filter { it.status != Download.DOWNLOADED }
         pending.forEach { if (it.status != Download.QUEUE) it.status = Download.QUEUE }
-
-        // Show download notification when simultaneous download > 1.
-        notifier.onProgressChange(queue)
 
         downloadsRelay.call(pending)
         return !pending.isEmpty()
@@ -185,14 +168,8 @@ class Downloader(private val context: Context,
 
         subscriptions.clear()
 
-        subscriptions += preferences.downloadThreads().asObservable()
-                .subscribe {
-                    threadsSubject.onNext(it)
-                    notifier.multipleDownloadThreads = it > 1
-                }
-
-        subscriptions += downloadsRelay.flatMap { Observable.from(it) }
-                .lift(DynamicConcurrentMergeOperator<Download, Download>({ downloadChapter(it) }, threadsSubject))
+        subscriptions += downloadsRelay.concatMapIterable { it }
+                .concatMap { downloadChapter(it).subscribeOn(Schedulers.io()) }
                 .onBackpressureBuffer()
                 .observeOn(AndroidSchedulers.mainThread())
                 .subscribe({ completeDownload(it)
@@ -250,15 +227,9 @@ class Downloader(private val context: Context,
             // Initialize queue size.
             notifier.initialQueueSize = queue.size
 
-            // Initial multi-thread
-            notifier.multipleDownloadThreads = preferences.downloadThreads().getOrDefault() > 1
-
             if (isRunning) {
                 // Send the list of downloads to the downloader.
                 downloadsRelay.call(chaptersToQueue)
-            } else {
-                // Show initial notification.
-                notifier.onProgressChange(queue)
             }
 
             // Start downloader if needed
@@ -273,7 +244,7 @@ class Downloader(private val context: Context,
      *
      * @param download the chapter to be downloaded.
      */
-    private fun downloadChapter(download: Download): Observable<Download> {
+    private fun downloadChapter(download: Download): Observable<Download> = Observable.defer {
         val chapterDirname = provider.getChapterDirName(download.chapter)
         val mangaDir = provider.getMangaDir(download.manga, download.source)
         val tmpDir = mangaDir.createDirectory("${chapterDirname}_tmp")
@@ -292,7 +263,7 @@ class Downloader(private val context: Context,
             Observable.just(download.pages!!)
         }
 
-        return pageListObservable
+        pageListObservable
                 .doOnNext { _ ->
                     // Delete all temporary (unfinished) files
                     tmpDir.listFiles()
@@ -307,18 +278,28 @@ class Downloader(private val context: Context,
                 // Start downloading images, consider we can have downloaded images already
                 .concatMap { page -> getOrDownloadImage(page, download, tmpDir) }
                 // Do when page is downloaded.
-                .doOnNext { notifier.onProgressChange(download, queue) }
+                .doOnNext { notifier.onProgressChange(download) }
                 .toList()
                 .map { _ -> download }
                 // Do after download completes
                 .doOnNext { ensureSuccessfulDownload(download, mangaDir, tmpDir, chapterDirname) }
                 // If the page list threw, it will resume here
                 .onErrorReturn { error ->
+                    // [EXH]
+                    XLog.w("> Download error!", error)
+                    XLog.w("> (source.id: %s, source.name: %s, manga.id: %s, manga.url: %s, chapter.id: %s, chapter.url: %s)",
+                            download.source.id,
+                            download.source.name,
+                            download.manga.id,
+                            download.manga.url,
+                            download.chapter.id,
+                            download.chapter.url)
+
                     download.status = Download.ERROR
                     notifier.onError(error.message, download.chapter.name)
                     download
                 }
-                .subscribeOn(Schedulers.io())
+
     }
 
     /**
@@ -385,6 +366,15 @@ class Downloader(private val context: Context,
                         val extension = getImageExtension(response, file)
                         file.renameTo("$filename.$extension")
                     } catch (e: Exception) {
+                        // [EXH]
+                        XLog.w("> Failed to fetch image!", e)
+                        XLog.w("> (source.id: %s, source.name: %s, page.index: %s, page.url: %s, page.imageUrl: %s)",
+                                source.id,
+                                source.name,
+                                page.index,
+                                page.url,
+                                page.imageUrl)
+
                         response.close()
                         file.delete()
                         throw e
@@ -408,7 +398,7 @@ class Downloader(private val context: Context,
             // Else guess from the uri.
             ?: context.contentResolver.getType(file.uri)
             // Else read magic numbers.
-            ?: DiskUtil.findImageMime { file.openInputStream() }
+            ?: ImageUtil.findImageType { file.openInputStream() }?.mime
 
         return MimeTypeMap.getSingleton().getExtensionFromMimeType(mime) ?: "jpg"
     }
@@ -448,7 +438,6 @@ class Downloader(private val context: Context,
         if (download.status == Download.DOWNLOADED) {
             // remove downloaded chapter from queue
             queue.remove(download)
-            notifier.onProgressChange(queue)
         }
         if (areAllDownloadsFinished()) {
             if (notifier.isSingleChapter && !notifier.errorThrown) {

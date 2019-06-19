@@ -2,8 +2,10 @@ package eu.kanade.tachiyomi.ui.main
 
 import android.animation.ObjectAnimator
 import android.app.ActivityManager
-import android.app.Service
+import android.app.SearchManager
 import android.app.usage.UsageStatsManager
+import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.os.Build
@@ -11,31 +13,37 @@ import android.os.Bundle
 import android.support.v4.view.GravityCompat
 import android.support.v4.widget.DrawerLayout
 import android.support.v7.graphics.drawable.DrawerArrowDrawable
+import android.support.v7.widget.Toolbar
 import android.view.ViewGroup
 import com.bluelinelabs.conductor.*
-import eu.kanade.tachiyomi.Migrations
 import eu.kanade.tachiyomi.R
 import eu.kanade.tachiyomi.data.preference.PreferencesHelper
 import eu.kanade.tachiyomi.data.preference.getOrDefault
 import eu.kanade.tachiyomi.ui.base.activity.BaseActivity
 import eu.kanade.tachiyomi.ui.base.controller.*
 import eu.kanade.tachiyomi.ui.catalogue.CatalogueController
+import eu.kanade.tachiyomi.ui.catalogue.global_search.CatalogueSearchController
 import eu.kanade.tachiyomi.ui.download.DownloadController
+import eu.kanade.tachiyomi.ui.extension.ExtensionController
 import eu.kanade.tachiyomi.ui.library.LibraryController
 import eu.kanade.tachiyomi.ui.manga.MangaController
 import eu.kanade.tachiyomi.ui.recent_updates.RecentChaptersController
 import eu.kanade.tachiyomi.ui.recently_read.RecentlyReadController
 import eu.kanade.tachiyomi.ui.setting.SettingsMainController
-import exh.metadata.loadAllMetadata
+import exh.uconfig.WarnConfigureDialogController
 import exh.ui.batchadd.BatchAddController
 import exh.ui.lock.LockChangeHandler
 import exh.ui.lock.LockController
 import exh.ui.lock.lockEnabled
 import exh.ui.lock.notifyLockSecurity
-import exh.ui.migration.MetadataFetchDialog
-import exh.util.defRealm
 import kotlinx.android.synthetic.main.main_activity.*
 import uy.kohesive.injekt.injectLazy
+import android.text.TextUtils
+import android.view.View
+import eu.kanade.tachiyomi.util.vibrate
+import exh.EXHMigrations
+import exh.ui.migration.MetadataFetchDialog
+import timber.log.Timber
 
 
 class MainActivity : BaseActivity() {
@@ -62,6 +70,7 @@ class MainActivity : BaseActivity() {
         setTheme(when (preferences.theme()) {
             2 -> R.style.Theme_Tachiyomi_Dark
             3 -> R.style.Theme_Tachiyomi_Amoled
+            4 -> R.style.Theme_Tachiyomi_DarkBlue
             else -> R.style.Theme_Tachiyomi
         })
         super.onCreate(savedInstanceState)
@@ -93,6 +102,7 @@ class MainActivity : BaseActivity() {
                     R.id.nav_drawer_recent_updates -> setRoot(RecentChaptersController(), id)
                     R.id.nav_drawer_recently_read -> setRoot(RecentlyReadController(), id)
                     R.id.nav_drawer_catalogues -> setRoot(CatalogueController(), id)
+                    R.id.nav_drawer_extensions -> setRoot(ExtensionController(), id)
                     // --> EXH
                     R.id.nav_drawer_batch_add -> setRoot(BatchAddController(), id)
                     // <-- EHX
@@ -140,33 +150,52 @@ class MainActivity : BaseActivity() {
 
         })
 
+        // --> EH
+        //Hook long press hamburger menu to lock
+        getToolbarNavigationIcon(toolbar)?.setOnLongClickListener {
+            if(lockEnabled(preferences)) {
+                doLock(true)
+                vibrate(50) // Notify user of lock
+                true
+            } else false
+        }
+
         //Show lock
         if (savedInstanceState == null) {
-            val lockEnabled = lockEnabled(preferences)
-            if (lockEnabled) {
+            if (lockEnabled(preferences)) {
                 //Special case first lock
-                toolbar.navigationIcon = null
                 doLock()
 
                 //Check lock security
                 notifyLockSecurity(this)
             }
         }
+        // <-- EH
 
         syncActivityViewWithController(router.backstack.lastOrNull()?.controller())
 
         if (savedInstanceState == null) {
             // Show changelog if needed
-            if (Migrations.upgrade(preferences)) {
+            // TODO
+//            if (Migrations.upgrade(preferences)) {
+//                ChangelogDialogController().showDialog(router)
+//            }
+
+            // EXH -->
+            // Perform EXH specific migrations
+            if(EXHMigrations.upgrade(preferences)) {
                 ChangelogDialogController().showDialog(router)
             }
-
             // Migrate metadata if empty (EH)
-            if(!defRealm {
-                it.loadAllMetadata().any {
-                    it.value.isNotEmpty()
-                }
-            }) MetadataFetchDialog().askMigration(this, false)
+            if(!preferences.migrateLibraryAsked().getOrDefault()) {
+                MetadataFetchDialog().askMigration(this, false)
+            }
+
+            // Upload settings
+            if(preferences.enableExhentai().getOrDefault()
+                    && preferences.eh_showSettingsUploadWarning().getOrDefault())
+                WarnConfigureDialogController.uploadSettings(router)
+            // EXH <--
         }
     }
 
@@ -182,10 +211,36 @@ class MainActivity : BaseActivity() {
             SHORTCUT_RECENTLY_UPDATED -> setSelectedDrawerItem(R.id.nav_drawer_recent_updates)
             SHORTCUT_RECENTLY_READ -> setSelectedDrawerItem(R.id.nav_drawer_recently_read)
             SHORTCUT_CATALOGUES -> setSelectedDrawerItem(R.id.nav_drawer_catalogues)
-            SHORTCUT_MANGA -> router.setRoot(RouterTransaction.with(MangaController(intent.extras)))
+            SHORTCUT_MANGA -> {
+                val extras = intent.extras ?: return false
+                router.setRoot(RouterTransaction.with(MangaController(extras)))
+            }
             SHORTCUT_DOWNLOADS -> {
                 if (router.backstack.none { it.controller() is DownloadController }) {
                     setSelectedDrawerItem(R.id.nav_drawer_downloads)
+                }
+            }
+            Intent.ACTION_SEARCH, "com.google.android.gms.actions.SEARCH_ACTION" -> {
+                //If the intent match the "standard" Android search intent
+                // or the Google-specific search intent (triggered by saying or typing "search *query* on *Tachiyomi*" in Google Search/Google Assistant)
+
+                //Get the search query provided in extras, and if not null, perform a global search with it.
+                val query = intent.getStringExtra(SearchManager.QUERY)
+                if (query != null && !query.isEmpty()) {
+                    if (router.backstackSize > 1) {
+                        router.popToRoot()
+                    }
+                    router.pushController(CatalogueSearchController(query).withFadeTransaction())
+                }
+            }
+            INTENT_SEARCH -> {
+                val query = intent.getStringExtra(INTENT_SEARCH_QUERY)
+                val filter = intent.getStringExtra(INTENT_SEARCH_FILTER)
+                if (query != null && !query.isEmpty()) {
+                    if (router.backstackSize > 1) {
+                        router.popToRoot()
+                    }
+                    router.pushController(CatalogueSearchController(query, filter).withFadeTransaction())
                 }
             }
             else -> return false
@@ -221,6 +276,31 @@ class MainActivity : BaseActivity() {
         router.setRoot(controller.withFadeTransaction().tag(id.toString()))
     }
 
+    fun getToolbarNavigationIcon(toolbar: Toolbar): View? {
+        try {
+            //check if contentDescription previously was set
+            val hadContentDescription = !TextUtils.isEmpty(toolbar.navigationContentDescription)
+            val contentDescription = if (!hadContentDescription) toolbar.navigationContentDescription else "navigationIcon"
+            toolbar.navigationContentDescription = contentDescription
+
+            val potentialViews = ArrayList<View>()
+
+            //find the view based on it's content description, set programmatically or with android:contentDescription
+            toolbar.findViewsWithText(potentialViews, contentDescription, View.FIND_VIEWS_WITH_CONTENT_DESCRIPTION)
+
+            //Nav icon is always instantiated at this point because calling setNavigationContentDescription ensures its existence
+            val navIcon = potentialViews.firstOrNull()
+
+            //Clear content description if not previously present
+            if (!hadContentDescription)
+                toolbar.navigationContentDescription = null
+            return navIcon
+        } catch(t: Throwable) {
+            Timber.w(t, "Could not find toolbar nav icon!")
+            return null
+        }
+    }
+
     private fun syncActivityViewWithController(to: Controller?, from: Controller? = null) {
         if (from is DialogController || to is DialogController) {
             return
@@ -237,6 +317,7 @@ class MainActivity : BaseActivity() {
         //Special case and hide drawer arrow for lock controller
         if(to is LockController) {
             supportActionBar?.setDisplayHomeAsUpEnabled(false)
+            toolbar.navigationIcon = null
         } else {
             supportActionBar?.setDisplayHomeAsUpEnabled(true)
             toolbar.navigationIcon = drawerArrow
@@ -296,8 +377,12 @@ class MainActivity : BaseActivity() {
         if(router.backstack.lastOrNull()?.controller() is LockController)
             return
 
+        //Do not lock if manual lock enabled
+        if(preferences.eh_lockManually().getOrDefault())
+            return
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            val mUsageStatsManager = getSystemService("usagestats") as UsageStatsManager
+            val mUsageStatsManager = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
             val time = System.currentTimeMillis()
             // We get usage stats for the last 20 seconds
             val sortedStats =
@@ -319,9 +404,9 @@ class MainActivity : BaseActivity() {
         }
     }
 
-    fun doLock() {
+    fun doLock(animate: Boolean = false) {
         router.pushController(RouterTransaction.with(LockController())
-                .popChangeHandler(LockChangeHandler()))
+                .popChangeHandler(LockChangeHandler(animate)))
     }
     // <-- EH
 
@@ -333,6 +418,10 @@ class MainActivity : BaseActivity() {
         const val SHORTCUT_CATALOGUES = "eu.kanade.tachiyomi.SHOW_CATALOGUES"
         const val SHORTCUT_DOWNLOADS = "eu.kanade.tachiyomi.SHOW_DOWNLOADS"
         const val SHORTCUT_MANGA = "eu.kanade.tachiyomi.SHOW_MANGA"
+
+        const val INTENT_SEARCH = "eu.kanade.tachiyomi.SEARCH"
+        const val INTENT_SEARCH_QUERY = "query"
+        const val INTENT_SEARCH_FILTER = "filter"
     }
 
 }

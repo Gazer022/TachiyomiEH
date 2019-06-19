@@ -1,106 +1,119 @@
 package eu.kanade.tachiyomi.source.online.english
 
+import android.content.Context
 import android.net.Uri
+import com.crashlytics.android.Crashlytics
 import com.github.salomonbrys.kotson.*
 import com.google.gson.JsonParser
+import eu.kanade.tachiyomi.data.preference.PreferencesHelper
+import eu.kanade.tachiyomi.data.preference.getOrDefault
+import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.source.model.*
 import eu.kanade.tachiyomi.source.online.LewdSource
 import eu.kanade.tachiyomi.source.online.ParsedHttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import eu.kanade.tachiyomi.util.toast
 import exh.TSUMINO_SOURCE_ID
-import exh.metadata.models.Tag
-import exh.metadata.models.TsuminoMetadata
-import exh.metadata.models.TsuminoMetadata.Companion.BASE_URL
+import exh.ui.captcha.ActionCompletionVerifier
+import exh.ui.captcha.BrowserActionActivity
+import exh.metadata.metadata.TsuminoSearchMetadata
+import exh.metadata.metadata.TsuminoSearchMetadata.Companion.BASE_URL
+import exh.metadata.metadata.TsuminoSearchMetadata.Companion.TAG_TYPE_DEFAULT
+import exh.metadata.metadata.base.RaisedSearchMetadata.Companion.TAG_TYPE_VIRTUAL
+import exh.metadata.metadata.base.RaisedTag
 import exh.util.urlImportFetchSearchManga
-import okhttp3.FormBody
-import okhttp3.Request
-import okhttp3.Response
+import okhttp3.*
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import rx.Observable
+import rx.schedulers.Schedulers
+import uy.kohesive.injekt.injectLazy
 import java.text.SimpleDateFormat
 import java.util.*
 
-class Tsumino: ParsedHttpSource(), LewdSource<TsuminoMetadata, Document> {
+class Tsumino(private val context: Context): ParsedHttpSource(), LewdSource<TsuminoSearchMetadata, Document>, ActionCompletionVerifier {
+    override val metaClass = TsuminoSearchMetadata::class
+
+    private val preferences: PreferencesHelper by injectLazy()
+
     override val id = TSUMINO_SOURCE_ID
     
     override val lang = "en"
     override val supportsLatest = true
     override val name = "Tsumino"
     
-    override fun queryAll() = TsuminoMetadata.EmptyQuery()
-    
-    override fun queryFromUrl(url: String) = TsuminoMetadata.UrlQuery(url)
-    
     override val baseUrl = BASE_URL
-    
-    override val metaParser: TsuminoMetadata.(Document) -> Unit = {
-        url = it.location()
-        tags.clear()
-        
-        it.getElementById("Title")?.text()?.let {
-            title = it.trim()
-        }
-        
-        it.getElementById("Artist")?.children()?.first()?.text()?.trim()?.let {
-            tags.add(Tag("artist", it, false))
-            artist = it
-        }
-    
-        it.getElementById("Uploader")?.children()?.first()?.text()?.trim()?.let {
-            tags.add(Tag("uploader", it, false))
-            uploader = it
-        }
-        
-        it.getElementById("Uploaded")?.text()?.let {
-            uploadDate = TM_DATE_FORMAT.parse(it.trim()).time
-        }
-        
-        it.getElementById("Pages")?.text()?.let {
-            length = it.trim().toIntOrNull()
-        }
-        
-        it.getElementById("Rating")?.text()?.let {
-            ratingString = it.trim()
-        }
-    
-        it.getElementById("Category")?.children()?.first()?.text()?.let {
-            category = it.trim()
-            tags.add(Tag("genre", it, false))
-        }
-        
-        it.getElementById("Collection")?.children()?.first()?.text()?.let {
-            collection = it.trim()
-        }
-        
-        it.getElementById("Group")?.children()?.first()?.text()?.let {
-            group = it.trim()
-            tags.add(Tag("group", it, false))
-        }
-        
-        parody.clear()
-        it.getElementById("Parody")?.children()?.forEach {
-            val entry = it.text().trim()
-            parody.add(entry)
-            tags.add(Tag("parody", entry, false))
-        }
-        
-        character.clear()
-        it.getElementById("Character")?.children()?.forEach {
-            val entry = it.text().trim()
-            character.add(entry)
-            tags.add(Tag("character", entry, false))
-        }
-        
-        it.getElementById("Tag")?.children()?.let {
-            tags.addAll(it.map {
-                Tag("tag", it.text().trim(), false)
-            })
+
+    override fun parseIntoMetadata(metadata: TsuminoSearchMetadata, input: Document) {
+        with(metadata) {
+            tmId = TsuminoSearchMetadata.tmIdFromUrl(input.location()).toInt()
+            tags.clear()
+
+            input.getElementById("Title")?.text()?.let {
+                title = it.trim()
+            }
+
+            input.getElementById("Artist")?.children()?.first()?.text()?.trim()?.let {
+                tags.add(RaisedTag("artist", it, TAG_TYPE_VIRTUAL))
+                artist = it
+            }
+
+            input.getElementById("Uploader")?.children()?.first()?.text()?.trim()?.let {
+                uploader = it
+            }
+
+            input.getElementById("Uploaded")?.text()?.let {
+                uploadDate = TM_DATE_FORMAT.parse(it.trim()).time
+            }
+
+            input.getElementById("Pages")?.text()?.let {
+                length = it.trim().toIntOrNull()
+            }
+
+            input.getElementById("Rating")?.text()?.let {
+                ratingString = it.trim()
+            }
+
+            input.getElementById("Category")?.children()?.first()?.text()?.let {
+                category = it.trim()
+                tags.add(RaisedTag("genre", it, TAG_TYPE_VIRTUAL))
+            }
+
+            input.getElementById("Collection")?.children()?.first()?.text()?.let {
+                collection = it.trim()
+            }
+
+            input.getElementById("Group")?.children()?.first()?.text()?.let {
+                group = it.trim()
+                tags.add(RaisedTag("group", it, TAG_TYPE_VIRTUAL))
+            }
+
+            val newParody = mutableListOf<String>()
+            input.getElementById("Parody")?.children()?.forEach {
+                val entry = it.text().trim()
+                newParody.add(entry)
+                tags.add(RaisedTag("parody", entry, TAG_TYPE_VIRTUAL))
+            }
+            parody = newParody
+
+            val newCharacter = mutableListOf<String>()
+            input.getElementById("Character")?.children()?.forEach {
+                val entry = it.text().trim()
+                newCharacter.add(entry)
+                tags.add(RaisedTag("character", entry, TAG_TYPE_VIRTUAL))
+            }
+            character = newCharacter
+
+            input.getElementById("Tag")?.children()?.let {
+                tags.addAll(it.map {
+                    RaisedTag(null, it.text().trim(), TAG_TYPE_DEFAULT)
+                })
+            }
         }
     }
-    
+
     fun genericMangaParse(response: Response): MangasPage {
         val json = jsonParser.parse(response.body()!!.string()!!).asJsonObject
         val hasNextPage = json["PageNumber"].int < json["PageCount"].int
@@ -110,8 +123,8 @@ class Tsumino: ParsedHttpSource(), LewdSource<TsuminoMetadata, Document> {
             
             SManga.create().apply {
                 val id = obj["Id"].long
-                setUrlWithoutDomain(TsuminoMetadata.mangaUrlFromId(id.toString()))
-                thumbnail_url = TsuminoMetadata.thumbUrlFromId(id.toString())
+                url = TsuminoSearchMetadata.mangaUrlFromId(id.toString())
+                thumbnail_url = BASE_URL + TsuminoSearchMetadata.thumbUrlFromId(id.toString())
                 
                 title = obj["Title"].string
             }
@@ -128,7 +141,7 @@ class Tsumino: ParsedHttpSource(), LewdSource<TsuminoMetadata, Document> {
                             excludeParodies: Boolean = false,
                             advSearch: List<AdvSearchEntry> = emptyList())
         = POST("$BASE_URL/Books/Operate", body = FormBody.Builder()
-            .add("PageNumber", (page + 1).toString())
+            .add("PageNumber", page.toString())
             .add("Text", query)
             .add("Sort", sort.name)
             .add("List", "0")
@@ -188,9 +201,10 @@ class Tsumino: ParsedHttpSource(), LewdSource<TsuminoMetadata, Document> {
     
     //Support direct URL importing
     override fun fetchSearchManga(page: Int, query: String, filters: FilterList) =
-            urlImportFetchSearchManga(query, {
+            urlImportFetchSearchManga(query) {
                 super.fetchSearchManga(page, query, filters)
-            })
+            }
+
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         // Append filters again, to provide fallback in case a filter is not provided
         // Since we only work with the first filter when building the result, if the filter is provided,
@@ -218,15 +232,30 @@ class Tsumino: ParsedHttpSource(), LewdSource<TsuminoMetadata, Document> {
     override fun searchMangaFromElement(element: Element) = throw UnsupportedOperationException("Unused method called!")
     override fun searchMangaNextPageSelector() = throw UnsupportedOperationException("Unused method called!")
     override fun searchMangaParse(response: Response) = genericMangaParse(response)
-    
+
+    override fun fetchMangaDetails(manga: SManga): Observable<SManga> {
+        return client.newCall(mangaDetailsRequest(manga))
+                .asObservableSuccess()
+                .flatMap {
+                    parseToManga(manga, it.asJsoup()).andThen(Observable.just(manga.apply {
+                        initialized = true
+                    }))
+                }
+    }
+
     override fun mangaDetailsParse(document: Document)
-            = parseToManga(queryFromUrl(document.location()), document)
-    
+            = throw UnsupportedOperationException("Unused method called!")
+
     override fun chapterListSelector() = throw UnsupportedOperationException("Unused method called!")
     override fun chapterFromElement(element: Element) = throw UnsupportedOperationException("Unused method called!")
-    override fun fetchChapterList(manga: SManga) = lazyLoadMeta(queryFromUrl(manga.url),
-            client.newCall(mangaDetailsRequest(manga)).asObservableSuccess().map { it.asJsoup() }
-    ).map {
+    override fun fetchChapterList(manga: SManga) = getOrLoadMetadata(manga.id) {
+        client.newCall(mangaDetailsRequest(manga))
+                .asObservableSuccess()
+                .map { it.asJsoup() }
+                .toSingle()
+    }.map {
+        trickTsumino(it.tmId)
+
         listOf(
                 SChapter.create().apply {
                     url = "/Read/View/${it.tmId}"
@@ -237,28 +266,105 @@ class Tsumino: ParsedHttpSource(), LewdSource<TsuminoMetadata, Document> {
                     chapter_number = 1f
                 }
         )
+    }.toObservable()
+
+    fun trickTsumino(id: Int?) {
+        if(id == null) return
+
+        //Make one call to /Read/View (ASP session cookie)
+        val rvReq = GET("$BASE_URL/Read/View/$id")
+        val resp = client.newCall(rvReq).execute()
+
+        // Make 5 requests to the first 5 pages of the book in reader process
+        var chain: Observable<Any> = Observable.just(0)
+        for(i in 1 .. 5) {
+            chain = chain.flatMap {
+                val req = GET("$BASE_URL/Read/Process/$id/$i")
+                client.newCall(req).asObservableSuccess()
+            }
+        }
+
+        chain.observeOn(Schedulers.io())
+                .subscribeOn(Schedulers.io())
+                .subscribe({}, {})
     }
-    
+
+    override val client: OkHttpClient
+        // Do not call super here as we don't want auto-captcha detection here
+        get() = network.client.newBuilder()
+                .cookieJar(CookieJar.NO_COOKIES)
+                .addNetworkInterceptor {
+                    val cAspNetCookie = preferences.eh_ts_aspNetCookie().getOrDefault()
+
+                    var request = it.request()
+
+                    if(cAspNetCookie.isNotBlank()) {
+                        request = it.request()
+                                .newBuilder()
+                                .header("Cookie", "ASP.NET_SessionId=$cAspNetCookie")
+                                .build()
+                    }
+
+                    val response = it.proceed(request)
+
+                    val newCookie = response.headers("Set-Cookie").map(String::trim).find {
+                        it.startsWith(ASP_NET_COOKIE_NAME)
+                    }
+
+                    if(newCookie != null) {
+                        val res = newCookie.substringAfter('=')
+                                .substringBefore(';')
+                                .trim()
+
+                        preferences.eh_ts_aspNetCookie().set(res)
+                    }
+
+                    response
+                }.build()
+
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
         val id = chapter.url.substringAfterLast('/')
         val call = POST("$BASE_URL/Read/Load", body = FormBody.Builder().add("q", id).build())
         return client.newCall(call).asObservableSuccess().map {
             val parsed = jsonParser.parse(it.body()!!.string()).obj
             val pageUrls = parsed["reader_page_urls"].array
-            
+
             val imageUrl = Uri.parse("$BASE_URL/Image/Object")
             pageUrls.mapIndexed { index, obj ->
                 val newImageUrl = imageUrl.buildUpon().appendQueryParameter("name", obj.string)
                 Page(index, chapter.url + "#${index + 1}", newImageUrl.toString())
             }
+        }.doOnError {
+            try {
+                val aspNetCookie = preferences.eh_ts_aspNetCookie().getOrDefault()
+
+                val cookiesMap = if (aspNetCookie.isNotBlank())
+                    mapOf(ASP_NET_COOKIE_NAME to aspNetCookie)
+                else
+                    emptyMap()
+
+                BrowserActionActivity.launchCaptcha(context,
+                        this,
+                        cookiesMap,
+                        CAPTCHA_SCRIPT,
+                        "$BASE_URL/Read/Auth/$id",
+                        ".book-read-button")
+            } catch(t: Throwable) {
+                Crashlytics.logException(t)
+                context.toast("Could not launch captcha-solving activity: ${t.message}")
+            }
         }
     }
-    
+
+    override fun verifyComplete(url: String): Boolean {
+        return Uri.parse(url).pathSegments.getOrNull(1) == "View"
+    }
+
     override fun pageListParse(document: Document) = throw UnsupportedOperationException("Unused method called!")
     override fun imageUrlParse(document: Document) = throw UnsupportedOperationException("Unused method called!")
-    
+
     data class AdvSearchEntry(val type: Int, val text: String, val exclude: Boolean)
-    
+
     override fun getFilterList() = FilterList(
             Filter.Header("Separate tags with commas"),
             Filter.Header("Prepend with dash to exclude"),
@@ -270,15 +376,15 @@ class Tsumino: ParsedHttpSource(), LewdSource<TsuminoMetadata, Document> {
             ParodyFilter(),
             CharactersFilter(),
             UploaderFilter(),
-            
+
             Filter.Separator(),
-            
+
             SortFilter(),
             LengthFilter(),
             MinimumRatingFilter(),
             ExcludeParodiesFilter()
     )
-    
+
     class TagFilter : AdvSearchEntryFilter("Tags", 1)
     class CategoryFilter : AdvSearchEntryFilter("Categories", 2)
     class CollectionFilter : AdvSearchEntryFilter("Collections", 3)
@@ -288,17 +394,25 @@ class Tsumino: ParsedHttpSource(), LewdSource<TsuminoMetadata, Document> {
     class CharactersFilter : AdvSearchEntryFilter("Characters", 7)
     class UploaderFilter : AdvSearchEntryFilter("Uploaders", 8)
     open class AdvSearchEntryFilter(name: String, val type: Int) : Filter.Text(name)
-    
+
     class SortFilter : Filter.Select<SortType>("Sort by", SortType.values())
     class LengthFilter : Filter.Select<LengthType>("Length", LengthType.values())
     class MinimumRatingFilter : Filter.Select<String>("Minimum rating", (0 .. 5).map { "$it stars" }.toTypedArray())
     class ExcludeParodiesFilter : Filter.CheckBox("Exclude parodies")
-    
+
     companion object {
         val jsonParser by lazy {
             JsonParser()
         }
-        
+
         val TM_DATE_FORMAT = SimpleDateFormat("yyyy MMM dd", Locale.US)
+
+        private val ASP_NET_COOKIE_NAME = "ASP.NET_SessionId"
+
+        private val CAPTCHA_SCRIPT = """
+            |try{ document.querySelector('.tsumino-nav-btn').remove(); } catch(e) {}
+            |try{ document.querySelector('.tsumino-nav-title').href = '#' ;} catch(e) {}
+            |try{ document.querySelector('.tsumino-nav-items').remove() ;} catch(e) {}
+            """.trimMargin()
     }
 }

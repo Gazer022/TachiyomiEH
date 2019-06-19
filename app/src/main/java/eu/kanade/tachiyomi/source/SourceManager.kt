@@ -1,35 +1,31 @@
 package eu.kanade.tachiyomi.source
 
-import android.Manifest.permission.READ_EXTERNAL_STORAGE
 import android.content.Context
-import android.content.pm.ApplicationInfo
-import android.content.pm.PackageManager
-import android.os.Environment
-import dalvik.system.PathClassLoader
+import com.elvishew.xlog.XLog
 import eu.kanade.tachiyomi.R
+import eu.kanade.tachiyomi.source.model.Page
+import eu.kanade.tachiyomi.source.model.SChapter
+import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.data.preference.PreferencesHelper
 import eu.kanade.tachiyomi.data.preference.getOrDefault
 import eu.kanade.tachiyomi.source.online.HttpSource
-import eu.kanade.tachiyomi.source.online.YamlHttpSource
 import eu.kanade.tachiyomi.source.online.all.EHentai
+import eu.kanade.tachiyomi.source.online.all.Hitomi
 import eu.kanade.tachiyomi.source.online.all.NHentai
 import eu.kanade.tachiyomi.source.online.all.PervEden
-import eu.kanade.tachiyomi.source.online.english.*
-import eu.kanade.tachiyomi.source.online.german.WieManga
-import eu.kanade.tachiyomi.source.online.russian.Mangachan
-import eu.kanade.tachiyomi.source.online.russian.Mintmanga
-import eu.kanade.tachiyomi.source.online.russian.Readmanga
-import eu.kanade.tachiyomi.util.hasPermission
+import eu.kanade.tachiyomi.source.online.english.HentaiCafe
+import eu.kanade.tachiyomi.source.online.english.Tsumino
+import rx.Observable
 import exh.EH_SOURCE_ID
 import exh.EXH_SOURCE_ID
 import exh.PERV_EDEN_EN_SOURCE_ID
 import exh.PERV_EDEN_IT_SOURCE_ID
-import exh.metadata.models.PervEdenLang
-import org.yaml.snakeyaml.Yaml
-import rx.Observable
-import timber.log.Timber
+import exh.metadata.metadata.PervEdenLang
+import exh.source.BlacklistedSources
+import exh.source.DelegatedHttpSource
+import exh.source.EnhancedHttpSource
 import uy.kohesive.injekt.injectLazy
-import java.io.File
+import kotlin.reflect.KClass
 
 open class SourceManager(private val context: Context) {
 
@@ -37,7 +33,11 @@ open class SourceManager(private val context: Context) {
 
     private val sourcesMap = mutableMapOf<Long, Source>()
 
+    private val stubSourcesMap = mutableMapOf<Long, StubSource>()
+
     init {
+        createInternalSources().forEach { registerSource(it) }
+
         //Recreate sources when they change
         val prefEntries = arrayOf(
                 prefs.enableExhentai(),
@@ -49,8 +49,7 @@ open class SourceManager(private val context: Context) {
         ).map { it.asObservable() }
 
         Observable.merge(prefEntries).skip(prefEntries.size - 1).subscribe {
-            sourcesMap.clear()
-            createSources()
+            createEHSources().forEach { registerSource(it) }
         }
     }
 
@@ -58,36 +57,45 @@ open class SourceManager(private val context: Context) {
         return sourcesMap[sourceKey]
     }
 
+    fun getOrStub(sourceKey: Long): Source {
+        return sourcesMap[sourceKey] ?: stubSourcesMap.getOrPut(sourceKey) {
+            StubSource(sourceKey)
+        }
+    }
+
     fun getOnlineSources() = sourcesMap.values.filterIsInstance<HttpSource>()
 
     fun getCatalogueSources() = sourcesMap.values.filterIsInstance<CatalogueSource>()
 
-    private fun createSources() {
-        createExtensionSources().forEach { registerSource(it) }
-        createYamlSources().forEach { registerSource(it) }
-        createInternalSources().forEach { registerSource(it) }
-        //EH
-        createEHSources().forEach { registerSource(it) }
-    }
+    internal fun registerSource(source: Source, overwrite: Boolean = false) {
+        // EXH -->
+        val sourceQName = source::class.qualifiedName
+        val delegate = DELEGATED_SOURCES[sourceQName]
+        val newSource = if(source is HttpSource && delegate != null) {
+            XLog.d("[EXH] Delegating source: %s -> %s!", sourceQName, delegate.newSourceClass.qualifiedName)
+            EnhancedHttpSource(
+                    source,
+                    delegate.newSourceClass.constructors.find { it.parameters.size == 1 }!!.call(source)
+            )
+        } else source
 
-    private fun registerSource(source: Source, overwrite: Boolean = false) {
+        if(source.id in BlacklistedSources.BLACKLISTED_EXT_SOURCES) {
+            XLog.d("[EXH] Removing blacklisted source: (id: %s, name: %s, lang: %s)!", source.id, source.name, (source as? CatalogueSource)?.lang)
+            return
+        }
+        // EXH <--
+
         if (overwrite || !sourcesMap.containsKey(source.id)) {
-            sourcesMap.put(source.id, source)
+            sourcesMap[source.id] = newSource
         }
     }
 
+    internal fun unregisterSource(source: Source) {
+        sourcesMap.remove(source.id)
+    }
+
     private fun createInternalSources(): List<Source> = listOf(
-            LocalSource(context),
-            Batoto(),
-            Mangahere(),
-            Mangafox(),
-            Kissmanga(),
-            Readmanga(),
-            Mintmanga(),
-            Mangachan(),
-            Readmangatoday(),
-            Mangasee(),
-            WieManga()
+            LocalSource(context)
     )
 
     private fun createEHSources(): List<Source> {
@@ -100,96 +108,50 @@ open class SourceManager(private val context: Context) {
         exSrcs += PervEden(PERV_EDEN_EN_SOURCE_ID, PervEdenLang.en)
         exSrcs += PervEden(PERV_EDEN_IT_SOURCE_ID, PervEdenLang.it)
         exSrcs += NHentai(context)
-        exSrcs += HentaiCafe()
-        exSrcs += Tsumino()
+        exSrcs += Tsumino(context)
+        exSrcs += Hitomi()
         return exSrcs
     }
 
-    private fun createYamlSources(): List<Source> {
-        val sources = mutableListOf<Source>()
+    private inner class StubSource(override val id: Long) : Source {
 
-        val parsersDir = File(Environment.getExternalStorageDirectory().absolutePath +
-                File.separator + context.getString(R.string.app_name), "parsers")
+        override val name: String
+            get() = id.toString()
 
-        if (parsersDir.exists() && context.hasPermission(READ_EXTERNAL_STORAGE)) {
-            val yaml = Yaml()
-            for (file in parsersDir.listFiles().filter { it.extension == "yml" }) {
-                try {
-                    val map = file.inputStream().use { yaml.loadAs(it, Map::class.java) }
-                    sources.add(YamlHttpSource(map))
-                } catch (e: Exception) {
-                    Timber.e("Error loading source from file. Bad format?", e)
-                }
-            }
-        }
-        return sources
-    }
-
-    private fun createExtensionSources(): List<Source> {
-        val pkgManager = context.packageManager
-        val flags = PackageManager.GET_CONFIGURATIONS or PackageManager.GET_SIGNATURES
-        val installedPkgs = pkgManager.getInstalledPackages(flags)
-        val extPkgs = installedPkgs.filter { it.reqFeatures.orEmpty().any { it.name == EXTENSION_FEATURE } }
-
-        val sources = mutableListOf<Source>()
-        for (pkgInfo in extPkgs) {
-            val appInfo = pkgManager.getApplicationInfo(pkgInfo.packageName,
-                    PackageManager.GET_META_DATA) ?: continue
-
-            val extName = pkgManager.getApplicationLabel(appInfo).toString()
-                    .substringAfter("Tachiyomi: ")
-            val version = pkgInfo.versionName
-            val sourceClasses = appInfo.metaData.getString(METADATA_SOURCE_CLASS)
-                    .split(";")
-                    .map {
-                        val sourceClass = it.trim()
-                        if(sourceClass.startsWith("."))
-                            pkgInfo.packageName + sourceClass
-                        else
-                            sourceClass
-                    }
-
-            val extension = Extension(extName, appInfo, version, sourceClasses)
-            try {
-                sources += loadExtension(extension)
-            } catch (e: Exception) {
-                Timber.e("Extension load error: $extName.", e)
-            } catch (e: LinkageError) {
-                Timber.e("Extension load error: $extName.", e)
-            }
-        }
-        return sources
-    }
-
-    private fun loadExtension(ext: Extension): List<Source> {
-        // Validate lib version
-        val majorLibVersion = ext.version.substringBefore('.').toInt()
-        if (majorLibVersion < LIB_VERSION_MIN || majorLibVersion > LIB_VERSION_MAX) {
-            throw Exception("Lib version is $majorLibVersion, while only versions "
-                    + "$LIB_VERSION_MIN to $LIB_VERSION_MAX are allowed")
+        override fun fetchMangaDetails(manga: SManga): Observable<SManga> {
+            return Observable.error(getSourceNotInstalledException())
         }
 
-        val classLoader = PathClassLoader(ext.appInfo.sourceDir, null, context.classLoader)
-        return ext.sourceClasses.flatMap {
-            val obj = Class.forName(it, false, classLoader).newInstance()
-            when(obj) {
-                is Source -> listOf(obj)
-                is SourceFactory -> obj.createSources()
-                else -> throw Exception("Unknown source class type!")
-            }
+        override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> {
+            return Observable.error(getSourceNotInstalledException())
+        }
+
+        override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
+            return Observable.error(getSourceNotInstalledException())
+        }
+
+        override fun toString(): String {
+            return name
+        }
+
+        private fun getSourceNotInstalledException(): Exception {
+            return Exception(context.getString(R.string.source_not_installed, id.toString()))
         }
     }
 
-    class Extension(val name: String,
-                    val appInfo: ApplicationInfo,
-                    val version: String,
-                    val sourceClasses: List<String>)
+    companion object {
+        val DELEGATED_SOURCES = listOf(
+                DelegatedSource(
+                        "Hentai Cafe",
+                        260868874183818481,
+                        "eu.kanade.tachiyomi.extension.all.foolslide.HentaiCafe",
+                        HentaiCafe::class
+                )
+        ).associateBy { it.originalSourcePackageName }
 
-    private companion object {
-        const val EXTENSION_FEATURE = "tachiyomi.extension"
-        const val METADATA_SOURCE_CLASS = "tachiyomi.extension.class"
-        const val LIB_VERSION_MIN = 1
-        const val LIB_VERSION_MAX = 1
+        data class DelegatedSource(val sourceName: String,
+                                   val sourceId: Long,
+                                   val originalSourcePackageName: String,
+                                   val newSourceClass: KClass<out DelegatedHttpSource>)
     }
-
 }

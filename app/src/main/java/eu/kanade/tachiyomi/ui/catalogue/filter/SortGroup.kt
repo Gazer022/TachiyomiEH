@@ -1,14 +1,20 @@
 package eu.kanade.tachiyomi.ui.catalogue.filter
 
+import android.support.v7.widget.RecyclerView
 import android.view.View
 import eu.davidea.flexibleadapter.FlexibleAdapter
 import eu.davidea.flexibleadapter.items.AbstractExpandableHeaderItem
+import eu.davidea.flexibleadapter.items.IFlexible
 import eu.davidea.flexibleadapter.items.ISectionable
 import eu.kanade.tachiyomi.R
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.util.setVectorCompat
 
 class SortGroup(val filter: Filter.Sort) : AbstractExpandableHeaderItem<SortGroup.Holder, ISectionable<*, *>>() {
+
+    init {
+        isExpanded = false
+    }
 
     override fun getLayoutRes(): Int {
         return R.layout.navigation_view_group
@@ -18,17 +24,20 @@ class SortGroup(val filter: Filter.Sort) : AbstractExpandableHeaderItem<SortGrou
         return 100
     }
 
-    override fun createViewHolder(view: View, adapter: FlexibleAdapter<*>): Holder {
+    override fun createViewHolder(view: View, adapter: FlexibleAdapter<IFlexible<RecyclerView.ViewHolder>>): Holder {
         return Holder(view, adapter)
     }
 
-    override fun bindViewHolder(adapter: FlexibleAdapter<*>, holder: Holder, position: Int, payloads: List<Any?>?) {
+    override fun bindViewHolder(adapter: FlexibleAdapter<IFlexible<RecyclerView.ViewHolder>>, holder: Holder, position: Int, payloads: List<Any?>?) {
         holder.title.text = filter.name
 
         holder.icon.setVectorCompat(if (isExpanded)
             R.drawable.ic_expand_more_white_24dp
         else
             R.drawable.ic_chevron_right_white_24dp)
+
+        holder.itemView.setOnClickListener(holder)
+
     }
 
     override fun equals(other: Any?): Boolean {

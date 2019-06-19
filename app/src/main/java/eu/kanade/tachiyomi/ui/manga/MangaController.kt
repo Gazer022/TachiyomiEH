@@ -13,6 +13,7 @@ import com.bluelinelabs.conductor.ControllerChangeHandler
 import com.bluelinelabs.conductor.ControllerChangeType
 import com.bluelinelabs.conductor.Router
 import com.bluelinelabs.conductor.RouterTransaction
+import com.bluelinelabs.conductor.support.RouterPagerAdapter
 import com.jakewharton.rxrelay.BehaviorRelay
 import com.jakewharton.rxrelay.PublishRelay
 import eu.kanade.tachiyomi.R
@@ -21,11 +22,11 @@ import eu.kanade.tachiyomi.data.database.models.Manga
 import eu.kanade.tachiyomi.data.track.TrackManager
 import eu.kanade.tachiyomi.source.Source
 import eu.kanade.tachiyomi.source.SourceManager
-import eu.kanade.tachiyomi.ui.base.controller.RouterPagerAdapter
 import eu.kanade.tachiyomi.ui.base.controller.RxController
 import eu.kanade.tachiyomi.ui.base.controller.TabbedController
 import eu.kanade.tachiyomi.ui.base.controller.requestPermissionsSafe
 import eu.kanade.tachiyomi.ui.manga.chapter.ChaptersController
+import eu.kanade.tachiyomi.ui.manga.chapter.ChaptersPresenter
 import eu.kanade.tachiyomi.ui.manga.info.MangaInfoController
 import eu.kanade.tachiyomi.ui.manga.track.TrackController
 import eu.kanade.tachiyomi.util.toast
@@ -34,18 +35,31 @@ import kotlinx.android.synthetic.main.manga_controller.*
 import rx.Subscription
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.util.Date
 
 class MangaController : RxController, TabbedController {
 
     constructor(manga: Manga?, fromCatalogue: Boolean = false) : super(Bundle().apply {
-        putLong(MANGA_EXTRA, manga?.id!!)
+        putLong(MANGA_EXTRA, manga?.id ?: 0)
         putBoolean(FROM_CATALOGUE_EXTRA, fromCatalogue)
     }) {
         this.manga = manga
         if (manga != null) {
-            source = Injekt.get<SourceManager>().get(manga.source)
+            source = Injekt.get<SourceManager>().getOrStub(manga.source)
         }
     }
+
+    // EXH -->
+    constructor(redirect: ChaptersPresenter.EXHRedirect) : super(Bundle().apply {
+        putLong(MANGA_EXTRA, redirect.manga.id!!)
+        putBoolean(UPDATE_EXTRA, redirect.update)
+    }) {
+        this.manga = redirect.manga
+        if (manga != null) {
+            source = Injekt.get<SourceManager>().getOrStub(redirect.manga.source)
+        }
+    }
+    // EXH <--
 
     constructor(mangaId: Long) : this(
             Injekt.get<DatabaseHelper>().getManga(mangaId).executeAsBlocking())
@@ -62,6 +76,10 @@ class MangaController : RxController, TabbedController {
     private var adapter: MangaDetailAdapter? = null
 
     val fromCatalogue = args.getBoolean(FROM_CATALOGUE_EXTRA, false)
+
+    val update = args.getBoolean(UPDATE_EXTRA, false)
+
+    val lastUpdateRelay: BehaviorRelay<Date> = BehaviorRelay.create()
 
     val chapterCountRelay: BehaviorRelay<Float> = BehaviorRelay.create()
 
@@ -177,6 +195,9 @@ class MangaController : RxController, TabbedController {
 
     companion object {
 
+        // EXH -->
+        const val UPDATE_EXTRA = "update"
+        // EXH <--
         const val FROM_CATALOGUE_EXTRA = "from_catalogue"
         const val MANGA_EXTRA = "manga"
 
@@ -184,8 +205,9 @@ class MangaController : RxController, TabbedController {
         const val CHAPTERS_CONTROLLER = 1
         const val TRACK_CONTROLLER = 2
 
-        private val tabField = TabLayout.Tab::class.java.getDeclaredField("mView")
+        private val tabField = TabLayout.Tab::class.java.getDeclaredField("view")
                 .apply { isAccessible = true }
     }
+
 
 }

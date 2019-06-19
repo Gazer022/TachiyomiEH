@@ -1,6 +1,8 @@
 package eu.kanade.tachiyomi.ui.setting
 
 import android.app.Dialog
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.support.v7.preference.PreferenceScreen
 import android.view.View
@@ -9,8 +11,8 @@ import eu.kanade.tachiyomi.BuildConfig
 import eu.kanade.tachiyomi.R
 import eu.kanade.tachiyomi.data.updater.GithubUpdateChecker
 import eu.kanade.tachiyomi.data.updater.GithubUpdateResult
-import eu.kanade.tachiyomi.data.updater.UpdateCheckerJob
-import eu.kanade.tachiyomi.data.updater.UpdateDownloaderService
+import eu.kanade.tachiyomi.data.updater.UpdaterJob
+import eu.kanade.tachiyomi.data.updater.UpdaterService
 import eu.kanade.tachiyomi.ui.base.controller.DialogController
 import eu.kanade.tachiyomi.util.toast
 import rx.Subscription
@@ -20,7 +22,8 @@ import timber.log.Timber
 import java.text.DateFormat
 import java.text.ParseException
 import java.text.SimpleDateFormat
-import java.util.*
+import java.util.Locale
+import java.util.TimeZone
 import eu.kanade.tachiyomi.data.preference.PreferenceKeys as Keys
 
 
@@ -51,14 +54,23 @@ class SettingsAboutController : SettingsController() {
                 onChange { newValue ->
                     val checked = newValue as Boolean
                     if (checked) {
-                        UpdateCheckerJob.setupTask()
+                        UpdaterJob.setupTask()
                     } else {
-                        UpdateCheckerJob.cancelTask()
+                        UpdaterJob.cancelTask()
                     }
                     true
                 }
             } else {
                 isVisible = false
+            }
+        }
+        preference {
+            title = "Github"
+            val url = "https://github.com/NerdNumber9/TachiyomiEH"
+            summary = url
+            onClick {
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                startActivity(intent)
             }
         }
         preference {
@@ -109,6 +121,7 @@ class SettingsAboutController : SettingsController() {
                         }
                     }
                 }, { error ->
+                    activity?.toast(error.message)
                     Timber.e(error)
                 })
     }
@@ -131,7 +144,7 @@ class SettingsAboutController : SettingsController() {
                         if (appContext != null) {
                             // Start download
                             val url = args.getString(URL_KEY)
-                            UpdateDownloaderService.downloadUpdate(appContext, url)
+                            UpdaterService.downloadUpdate(appContext, url)
                         }
                     }
                     .build()

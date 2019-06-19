@@ -9,10 +9,15 @@ import eu.kanade.tachiyomi.data.database.models.Manga
 import eu.kanade.tachiyomi.data.download.DownloadManager
 import eu.kanade.tachiyomi.data.download.model.Download
 import eu.kanade.tachiyomi.data.preference.PreferencesHelper
+import eu.kanade.tachiyomi.data.preference.getOrDefault
+import eu.kanade.tachiyomi.source.LocalSource
 import eu.kanade.tachiyomi.source.Source
 import eu.kanade.tachiyomi.ui.base.presenter.BasePresenter
 import eu.kanade.tachiyomi.util.isNullOrUnsubscribed
 import eu.kanade.tachiyomi.util.syncChaptersWithSource
+import exh.EH_SOURCE_ID
+import exh.EXH_SOURCE_ID
+import exh.eh.EHentaiUpdateHelper
 import rx.Observable
 import rx.Subscription
 import rx.android.schedulers.AndroidSchedulers
@@ -20,6 +25,8 @@ import rx.schedulers.Schedulers
 import timber.log.Timber
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import uy.kohesive.injekt.injectLazy
+import java.util.Date
 
 /**
  * Presenter of [ChaptersController].
@@ -28,6 +35,7 @@ class ChaptersPresenter(
         val manga: Manga,
         val source: Source,
         private val chapterCountRelay: BehaviorRelay<Float>,
+        private val lastUpdateRelay: BehaviorRelay<Date>,
         private val mangaFavoriteRelay: PublishRelay<Boolean>,
         val preferences: PreferencesHelper = Injekt.get(),
         private val db: DatabaseHelper = Injekt.get(),
@@ -62,6 +70,14 @@ class ChaptersPresenter(
      */
     private var observeDownloadsSubscription: Subscription? = null
 
+    // EXH -->
+    private val updateHelper: EHentaiUpdateHelper by injectLazy()
+
+    val redirectUserRelay = BehaviorRelay.create<EXHRedirect>()
+
+    data class EXHRedirect(val manga: Manga, val update: Boolean)
+    // EXH <--
+
     override fun onCreate(savedState: Bundle?) {
         super.onCreate(savedState)
 
@@ -91,6 +107,30 @@ class ChaptersPresenter(
                     // Emit the number of chapters to the info tab.
                     chapterCountRelay.call(chapters.maxBy { it.chapter_number }?.chapter_number
                             ?: 0f)
+
+                    // Emit the upload date of the most recent chapter
+                    lastUpdateRelay.call(Date(chapters.maxBy { it.date_upload }?.date_upload
+                            ?: 0))
+
+                    // EXH -->
+                    if(chapters.isNotEmpty()
+                            && (source.id == EXH_SOURCE_ID || source.id == EH_SOURCE_ID)) {
+                        // Check for gallery in library and accept manga with lowest id
+                        // Find chapters sharing same root
+                        add(updateHelper.findAcceptedRootAndDiscardOthers(chapters)
+                                .subscribeOn(Schedulers.io())
+                                .subscribe { (acceptedChain, _) ->
+                                    // Redirect if we are not the accepted root
+                                    if(manga.id != acceptedChain.manga.id) {
+                                        // Update if any of our chapters are not in accepted manga's chapters
+                                        val ourChapterUrls = chapters.map { it.url }.toSet()
+                                        val acceptedChapterUrls = acceptedChain.chapters.map { it.url }.toSet()
+                                        val update = (ourChapterUrls - acceptedChapterUrls).isNotEmpty()
+                                        redirectUserRelay.call(EXHRedirect(acceptedChain.manga, update))
+                                    }
+                                })
+                    }
+                    // EXH <--
                 }
                 .subscribe { chaptersRelay.call(it) })
     }
@@ -172,7 +212,7 @@ class ChaptersPresenter(
             observable = observable.filter { it.read }
         }
         if (onlyDownloaded()) {
-            observable = observable.filter { it.isDownloaded }
+            observable = observable.filter { it.isDownloaded || it.manga.source == LocalSource.ID }
         }
         if (onlyBookmarked()) {
             observable = observable.filter { it.bookmark }
@@ -226,7 +266,9 @@ class ChaptersPresenter(
         Observable.from(selectedChapters)
                 .doOnNext { chapter ->
                     chapter.read = read
-                    if (!read) {
+                    if (!read /* --> EH */ && !preferences
+                                    .eh_preserveReadingPosition()
+                                    .getOrDefault() /* <-- EH */) {
                         chapter.last_page_read = 0
                     }
                 }
@@ -264,9 +306,8 @@ class ChaptersPresenter(
      * @param chapters the list of chapters to delete.
      */
     fun deleteChapters(chapters: List<ChapterItem>) {
-        Observable.from(chapters)
-                .doOnNext { deleteChapter(it) }
-                .toList()
+        Observable.just(chapters)
+                .doOnNext { deleteChaptersInternal(chapters) }
                 .doOnNext { if (onlyDownloaded()) refreshChapters() }
                 .subscribeOn(Schedulers.io())
                 .observeOn(AndroidSchedulers.mainThread())
@@ -276,14 +317,15 @@ class ChaptersPresenter(
     }
 
     /**
-     * Deletes a chapter from disk. This method is called in a background thread.
-     * @param chapter the chapter to delete.
+     * Deletes a list of chapters from disk. This method is called in a background thread.
+     * @param chapters the chapters to delete.
      */
-    private fun deleteChapter(chapter: ChapterItem) {
-        downloadManager.queue.remove(chapter)
-        downloadManager.deleteChapter(chapter, manga, source)
-        chapter.status = Download.NOT_DOWNLOADED
-        chapter.download = null
+    private fun deleteChaptersInternal(chapters: List<ChapterItem>) {
+        downloadManager.deleteChapters(chapters, manga, source)
+        chapters.forEach {
+            it.status = Download.NOT_DOWNLOADED
+            it.download = null
+        }
     }
 
     /**
@@ -404,7 +446,8 @@ class ChaptersPresenter(
      * Whether the sorting method is descending or ascending.
      */
     fun sortDescending(): Boolean {
-        return manga.sortDescending()
+        return !((source.id == EH_SOURCE_ID || source.id == EXH_SOURCE_ID)
+                && preferences.eh_forceSortEhVersionsAsc().getOrDefault()) && manga.sortDescending()
     }
 
 }

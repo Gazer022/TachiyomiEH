@@ -10,6 +10,7 @@ import eu.kanade.tachiyomi.util.gone
 import eu.kanade.tachiyomi.util.setVectorCompat
 import eu.kanade.tachiyomi.util.visible
 import kotlinx.android.synthetic.main.catalogue_global_search_controller_card.*
+import kotlinx.android.synthetic.main.catalogue_global_search_controller_card.view.*
 
 /**
  * Holder that binds the [CatalogueSearchItem] containing catalogue cards.
@@ -34,6 +35,13 @@ class CatalogueSearchHolder(view: View, val adapter: CatalogueSearchAdapter) :
 
         nothing_found_icon.setVectorCompat(R.drawable.ic_search_black_112dp,
                 view.context.getResourceColor(android.R.attr.textColorHint))
+
+        more.setOnClickListener {
+            val item = adapter.getItem(adapterPosition)
+            if (item != null) {
+                adapter.moreClickListener.onMoreClick(item.source)
+            }
+        }
     }
 
     /**
@@ -45,8 +53,11 @@ class CatalogueSearchHolder(view: View, val adapter: CatalogueSearchAdapter) :
         val source = item.source
         val results = item.results
 
-        // Set Title witch country code if available.
-        title.text = if (!source.lang.isEmpty()) "${source.name} (${source.lang})" else source.name
+        val titlePrefix = if (item.highlighted) "▶" else ""
+        val langSuffix = if (source.lang.isNotEmpty()) " (${source.lang})" else ""
+
+        // Set Title with country code if available.
+        title.text = titlePrefix + source.name + langSuffix
 
         when {
             results == null -> {
@@ -93,5 +104,4 @@ class CatalogueSearchHolder(view: View, val adapter: CatalogueSearchAdapter) :
 
         return null
     }
-
 }

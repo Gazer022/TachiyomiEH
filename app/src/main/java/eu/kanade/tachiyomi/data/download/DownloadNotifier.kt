@@ -36,18 +36,12 @@ internal class DownloadNotifier(private val context: Context) {
      * The size of queue on start download.
      */
     var initialQueueSize = 0
-        get() = field
         set(value) {
-            if (value != 0){
+            if (value != 0) {
                 isSingleChapter = (value == 1)
             }
             field = value
         }
-
-    /**
-     * Simultaneous download setting > 1.
-     */
-    var multipleDownloadThreads = false
 
     /**
      * Updated when error is thrown
@@ -91,36 +85,10 @@ internal class DownloadNotifier(private val context: Context) {
 
     /**
      * Called when download progress changes.
-     * Note: Only accepted when multi download active.
-     *
-     * @param queue the queue containing downloads.
-     */
-    fun onProgressChange(queue: DownloadQueue) {
-        if (multipleDownloadThreads) {
-            doOnProgressChange(null, queue)
-        }
-    }
-
-    /**
-     * Called when download progress changes.
-     * Note: Only accepted when single download active.
      *
      * @param download download object containing download information.
-     * @param queue the queue containing downloads.
      */
-    fun onProgressChange(download: Download, queue: DownloadQueue) {
-        if (!multipleDownloadThreads) {
-            doOnProgressChange(download, queue)
-        }
-    }
-
-    /**
-     * Show notification progress of chapter.
-     *
-     * @param download download object containing download information.
-     * @param queue the queue containing downloads.
-     */
-    private fun doOnProgressChange(download: Download?, queue: DownloadQueue) {
+    fun onProgressChange(download: Download) {
         // Create notification
         with(notification) {
             // Check if first call.
@@ -131,30 +99,19 @@ internal class DownloadNotifier(private val context: Context) {
                 // Open download manager when clicked
                 setContentIntent(NotificationHandler.openDownloadManagerPendingActivity(context))
                 isDownloading = true
+                // Pause action
+                addAction(R.drawable.ic_av_pause_grey_24dp_img,
+                        context.getString(R.string.action_pause),
+                        NotificationReceiver.pauseDownloadsPendingBroadcast(context))
             }
 
-            if (multipleDownloadThreads) {
-                setContentTitle(context.getString(R.string.app_name))
-
-                // Reset the queue size if the download progress is negative
-                if ((initialQueueSize - queue.size) < 0)
-                    initialQueueSize = queue.size
-
-                setContentText(context.getString(R.string.chapter_downloading_progress)
-                        .format(initialQueueSize - queue.size, initialQueueSize))
-                setProgress(initialQueueSize, initialQueueSize - queue.size, false)
-            } else {
-                download?.let {
-                    val title = it.manga.title.chop(15)
-                    val quotedTitle = Pattern.quote(title)
-                    val chapter = download.chapter.name.replaceFirst("$quotedTitle[\\s]*[-]*[\\s]*".toRegex(RegexOption.IGNORE_CASE), "")
-                    setContentTitle("$title - $chapter".chop(30))
-                    setContentText(context.getString(R.string.chapter_downloading_progress)
-                            .format(it.downloadedImages, it.pages!!.size))
-                    setProgress(it.pages!!.size, it.downloadedImages, false)
-
-                }
-            }
+            val title = download.manga.title.chop(15)
+            val quotedTitle = Pattern.quote(title)
+            val chapter = download.chapter.name.replaceFirst("$quotedTitle[\\s]*[-]*[\\s]*".toRegex(RegexOption.IGNORE_CASE), "")
+            setContentTitle("$title - $chapter".chop(30))
+            setContentText(context.getString(R.string.chapter_downloading_progress)
+                    .format(download.downloadedImages, download.pages!!.size))
+            setProgress(download.pages!!.size, download.downloadedImages, false)
         }
         // Displays the progress bar on notification
         notification.show()

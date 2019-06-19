@@ -26,9 +26,6 @@ class CatalogueGridHolder(private val view: View, private val adapter: FlexibleA
      * @param manga the manga to bind.
      */
     override fun onSetValues(manga: Manga) {
-        // Set manga title
-        title.text = manga.title
-
         // Set alpha of thumbnail.
         thumbnail.alpha = if (manga.favorite) 0.3f else 1.0f
 
@@ -36,13 +33,15 @@ class CatalogueGridHolder(private val view: View, private val adapter: FlexibleA
     }
 
     override fun setImage(manga: Manga) {
+        // Set manga title
+        title.text = manga.title
+
         GlideApp.with(view.context).clear(thumbnail)
         if (!manga.thumbnail_url.isNullOrEmpty()) {
             GlideApp.with(view.context)
                     .load(manga)
                     .diskCacheStrategy(DiskCacheStrategy.DATA)
                     .centerCrop()
-                    .skipMemoryCache(true)
                     .placeholder(android.R.color.transparent)
                     .into(StateImageViewTarget(thumbnail, progress))
         }

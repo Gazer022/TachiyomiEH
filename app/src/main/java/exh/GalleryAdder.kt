@@ -1,6 +1,7 @@
 package exh
 
 import android.net.Uri
+import com.elvishew.xlog.XLog
 import com.github.salomonbrys.kotson.*
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
@@ -9,13 +10,12 @@ import eu.kanade.tachiyomi.data.database.DatabaseHelper
 import eu.kanade.tachiyomi.data.database.models.Manga
 import eu.kanade.tachiyomi.network.NetworkHelper
 import eu.kanade.tachiyomi.source.SourceManager
+import eu.kanade.tachiyomi.source.online.all.EHentai
 import eu.kanade.tachiyomi.util.syncChaptersWithSource
-import exh.metadata.models.*
-import exh.util.defRealm
+import exh.metadata.metadata.EHentaiSearchMetadata
 import okhttp3.MediaType
 import okhttp3.Request
 import okhttp3.RequestBody
-import timber.log.Timber
 import uy.kohesive.injekt.injectLazy
 import java.net.URI
 import java.net.URISyntaxException
@@ -29,7 +29,7 @@ class GalleryAdder {
     private val networkHelper: NetworkHelper by injectLazy()
 
     companion object {
-        const val API_BASE = "https://api.e-hentai.org/api.php"
+        const val EH_API_BASE = "https://api.e-hentai.org/api.php"
         val JSON = MediaType.parse("application/json; charset=utf-8")!!
     }
 
@@ -51,7 +51,7 @@ class GalleryAdder {
         }
 
         val outJson = JsonParser().parse(networkHelper.client.newCall(Request.Builder()
-                .url(API_BASE)
+                .url(EH_API_BASE)
                 .post(RequestBody.create(JSON, json.toString()))
                 .build()).execute().body()!!.string()).obj
 
@@ -61,7 +61,9 @@ class GalleryAdder {
 
     fun addGallery(url: String,
                    fav: Boolean = false,
-                   forceSource: Long? = null): GalleryAddEvent {
+                   forceSource: Long? = null,
+                   throttleFunc: () -> Unit = {}): GalleryAddEvent {
+        XLog.d("Importing gallery (url: %s, fav: %s, forceSource: %s)...", url, fav, forceSource)
         try {
             val urlObj = Uri.parse(url)
             val lowercasePs = urlObj.pathSegments.map(String::toLowerCase)
@@ -79,12 +81,16 @@ class GalleryAdder {
                 }
                 "hentai.cafe" -> HENTAI_CAFE_SOURCE_ID
                 "www.tsumino.com" -> TSUMINO_SOURCE_ID
+                "hitomi.la" -> HITOMI_SOURCE_ID
                 else -> return GalleryAddEvent.Fail.UnknownType(url)
             }
 
             if(forceSource != null && source != forceSource) {
                 return GalleryAddEvent.Fail.UnknownType(url)
             }
+
+            val sourceObj = sourceManager.get(source)
+                    ?: return GalleryAddEvent.Fail.Error(url, "Source not installed!")
 
             val realUrl = when(source) {
                 EH_SOURCE_ID, EXH_SOURCE_ID -> when (lcFirstPathSegment) {
@@ -124,19 +130,23 @@ class GalleryAdder {
                         
                     "https://tsumino.com/Book/Info/${urlObj.pathSegments[2]}"
                 }
+                HITOMI_SOURCE_ID -> {
+                    if(lcFirstPathSegment != "galleries" && lcFirstPathSegment != "reader")
+                        return GalleryAddEvent.Fail.UnknownType(url)
+
+                    "https://hitomi.la/galleries/${urlObj.pathSegments[1].substringBefore('.')}.html"
+                }
                 else -> return GalleryAddEvent.Fail.UnknownType(url)
             }
 
-            val sourceObj = sourceManager.get(source)
-                    ?: return GalleryAddEvent.Fail.Error(url, "Could not find EH source!")
-
             val cleanedUrl = when(source) {
-                EH_SOURCE_ID, EXH_SOURCE_ID -> getUrlWithoutDomain(realUrl)
-                NHENTAI_SOURCE_ID -> realUrl //nhentai uses URLs directly (oops, my bad when implementing this source)
+                EH_SOURCE_ID, EXH_SOURCE_ID -> EHentaiSearchMetadata.normalizeUrl(getUrlWithoutDomain(realUrl))
+                NHENTAI_SOURCE_ID -> getUrlWithoutDomain(realUrl)
                 PERV_EDEN_EN_SOURCE_ID,
                 PERV_EDEN_IT_SOURCE_ID -> getUrlWithoutDomain(realUrl)
                 HENTAI_CAFE_SOURCE_ID -> getUrlWithoutDomain(realUrl)
                 TSUMINO_SOURCE_ID -> getUrlWithoutDomain(realUrl)
+                HITOMI_SOURCE_ID -> getUrlWithoutDomain(realUrl)
                 else -> return GalleryAddEvent.Fail.UnknownType(url)
             }
 
@@ -147,43 +157,46 @@ class GalleryAdder {
                 title = realUrl
             }
 
-            //Copy basics
+            // Insert created manga if not in DB before fetching details
+            // This allows us to keep the metadata when fetching details
+            if(manga.id == null) {
+                db.insertManga(manga).executeAsBlocking().insertedId()?.let {
+                    manga.id = it
+                }
+            }
+
+            // Fetch and copy details
             val newManga = sourceObj.fetchMangaDetails(manga).toBlocking().first()
             manga.copyFrom(newManga)
-            manga.title = newManga.title //Forcibly copy title as copyFrom does not copy title
-
-            //Apply metadata
-            defRealm { realm ->
-                when (source) {
-                    EH_SOURCE_ID, EXH_SOURCE_ID -> ExGalleryMetadata.UrlQuery(realUrl, isExSource(source))
-                    NHENTAI_SOURCE_ID -> NHentaiMetadata.UrlQuery(realUrl)
-                    PERV_EDEN_EN_SOURCE_ID,
-                    PERV_EDEN_IT_SOURCE_ID -> PervEdenGalleryMetadata.UrlQuery(realUrl, PervEdenLang.source(source))
-                    HENTAI_CAFE_SOURCE_ID -> HentaiCafeMetadata.UrlQuery(realUrl)
-                    TSUMINO_SOURCE_ID -> TsuminoMetadata.UrlQuery(realUrl)
-                    else -> return GalleryAddEvent.Fail.UnknownType(url)
-                }.query(realm).findFirst()
-            }
+            manga.initialized = true
 
             if (fav) manga.favorite = true
 
-            db.insertManga(manga).executeAsBlocking().insertedId()?.let {
-                manga.id = it
-            }
+            db.insertManga(manga).executeAsBlocking()
 
             //Fetch and copy chapters
             try {
-                sourceObj.fetchChapterList(manga).map {
+                val chapterListObs = if(sourceObj is EHentai) {
+                    sourceObj.fetchChapterList(manga, throttleFunc)
+                } else {
+                    sourceObj.fetchChapterList(manga)
+                }
+                chapterListObs.map {
                     syncChaptersWithSource(db, it, manga, sourceObj)
                 }.toBlocking().first()
             } catch (e: Exception) {
-                Timber.e(e, "Failed to update chapters for gallery: ${manga.title}!")
+                XLog.w("Failed to update chapters for gallery: ${manga.title}!", e)
                 return GalleryAddEvent.Fail.Error(url, "Failed to update chapters for gallery: $url")
             }
 
             return GalleryAddEvent.Success(url, manga)
         } catch(e: Exception) {
-            Timber.e(e, "Could not add gallery!")
+            XLog.w("Could not add gallery (url: $url)!", e)
+
+            if(e is EHentai.GalleryNotFoundException) {
+                return GalleryAddEvent.Fail.NotFound(url)
+            }
+
             return GalleryAddEvent.Fail.Error(url,
                     ((e.message ?: "Unknown error!") + " (Gallery: $url)").trim())
         }
@@ -221,7 +234,10 @@ sealed class GalleryAddEvent {
             override val logMessage = "Unknown gallery type for gallery: $galleryUrl"
         }
 
-        class Error(override val galleryUrl: String,
+        open class Error(override val galleryUrl: String,
                     override val logMessage: String): Fail()
+
+        class NotFound(galleryUrl: String):
+                Error(galleryUrl, "Gallery does not exist: $galleryUrl")
     }
 }

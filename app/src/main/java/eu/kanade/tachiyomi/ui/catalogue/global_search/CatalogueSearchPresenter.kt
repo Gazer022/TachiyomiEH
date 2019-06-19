@@ -5,6 +5,7 @@ import eu.kanade.tachiyomi.data.database.DatabaseHelper
 import eu.kanade.tachiyomi.data.database.models.Manga
 import eu.kanade.tachiyomi.data.preference.PreferencesHelper
 import eu.kanade.tachiyomi.data.preference.getOrDefault
+import eu.kanade.tachiyomi.extension.ExtensionManager
 import eu.kanade.tachiyomi.source.CatalogueSource
 import eu.kanade.tachiyomi.source.Source
 import eu.kanade.tachiyomi.source.SourceManager
@@ -21,6 +22,7 @@ import rx.subjects.PublishSubject
 import timber.log.Timber
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import uy.kohesive.injekt.injectLazy
 
 /**
  * Presenter of [CatalogueSearchController]
@@ -30,8 +32,9 @@ import uy.kohesive.injekt.api.get
  * @param db manages the database calls.
  * @param preferencesHelper manages the preference calls.
  */
-class CatalogueSearchPresenter(
+open class CatalogueSearchPresenter(
         val initialQuery: String? = "",
+        val initialExtensionFilter: String? = null,
         val sourceManager: SourceManager = Injekt.get(),
         val db: DatabaseHelper = Injekt.get(),
         val preferencesHelper: PreferencesHelper = Injekt.get()
@@ -40,7 +43,7 @@ class CatalogueSearchPresenter(
     /**
      * Enabled sources.
      */
-    val sources by lazy { getEnabledSources() }
+    val sources by lazy { getSourcesToQuery() }
 
     /**
      * Query from the view.
@@ -63,8 +66,15 @@ class CatalogueSearchPresenter(
      */
     private var fetchImageSubscription: Subscription? = null
 
+    private val extensionManager by injectLazy<ExtensionManager>()
+
+    private var extensionFilter: String? = null
+
     override fun onCreate(savedState: Bundle?) {
         super.onCreate(savedState)
+
+        extensionFilter = savedState?.getString(CatalogueSearchPresenter::extensionFilter.name) ?:
+                          initialExtensionFilter
 
         // Perform a search with previous or initial state
         search(savedState?.getString(BrowseCataloguePresenter::query.name) ?: initialQuery.orEmpty())
@@ -78,6 +88,7 @@ class CatalogueSearchPresenter(
 
     override fun onSave(state: Bundle) {
         state.putString(BrowseCataloguePresenter::query.name, query)
+        state.putString(CatalogueSearchPresenter::extensionFilter.name, extensionFilter)
         super.onSave(state)
     }
 
@@ -86,7 +97,7 @@ class CatalogueSearchPresenter(
      *
      * @return list containing enabled sources.
      */
-    private fun getEnabledSources(): List<CatalogueSource> {
+    protected open fun getEnabledSources(): List<CatalogueSource> {
         val languages = preferencesHelper.enabledLanguages().getOrDefault()
         val hiddenCatalogues = preferencesHelper.hiddenCatalogues().getOrDefault()
 
@@ -97,8 +108,35 @@ class CatalogueSearchPresenter(
                 .sortedBy { "(${it.lang}) ${it.name}" }
     }
 
+    private fun getSourcesToQuery(): List<CatalogueSource> {
+        val filter = extensionFilter
+        val enabledSources = getEnabledSources()
+        if (filter.isNullOrEmpty()) {
+            return enabledSources
+        }
+
+        val filterSources = extensionManager.installedExtensions
+            .filter { it.pkgName == filter }
+            .flatMap { it.sources }
+            .filter { it in enabledSources }
+            .filterIsInstance<CatalogueSource>()
+
+        if (filterSources.isEmpty()) {
+            return enabledSources
+        }
+
+        return filterSources
+    }
+
     /**
-     * Initiates a search for mnaga per catalogue.
+     * Creates a catalogue search item
+     */
+    protected open fun createCatalogueSearchItem(source: CatalogueSource, results: List<CatalogueSearchCardItem>?): CatalogueSearchItem {
+        return CatalogueSearchItem(source, results)
+    }
+
+    /**
+     * Initiates a search for manga per catalogue.
      *
      * @param query query on which to search.
      */
@@ -113,7 +151,7 @@ class CatalogueSearchPresenter(
         initializeFetchImageSubscription()
 
         // Create items with the initial state
-        val initialItems = sources.map { CatalogueSearchItem(it, null) }
+        val initialItems = sources.map { createCatalogueSearchItem(it, null) }
         var items = initialItems
 
         fetchSourcesSubscription?.unsubscribe()
@@ -125,7 +163,7 @@ class CatalogueSearchPresenter(
                             .map { it.mangas.take(10) } // Get at most 10 manga from search result.
                             .map { it.map { networkToLocalManga(it, source.id) } } // Convert to local manga.
                             .doOnNext { fetchImage(it, source) } // Load manga covers.
-                            .map { CatalogueSearchItem(source, it.map { CatalogueSearchCardItem(it) }) }
+                            .map { createCatalogueSearchItem(source, it.map { CatalogueSearchCardItem(it) }) }
                 }, 5)
                 .observeOn(AndroidSchedulers.mainThread())
                 // Update matching source with the obtained results

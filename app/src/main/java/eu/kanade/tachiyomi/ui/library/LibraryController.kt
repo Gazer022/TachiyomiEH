@@ -12,6 +12,7 @@ import android.support.v7.app.AppCompatActivity
 import android.support.v7.view.ActionMode
 import android.support.v7.widget.SearchView
 import android.view.*
+import com.afollestad.materialdialogs.MaterialDialog
 import com.bluelinelabs.conductor.ControllerChangeHandler
 import com.bluelinelabs.conductor.ControllerChangeType
 import com.f2prateek.rx.preferences.Preference
@@ -32,14 +33,12 @@ import eu.kanade.tachiyomi.ui.base.controller.withFadeTransaction
 import eu.kanade.tachiyomi.ui.category.CategoryController
 import eu.kanade.tachiyomi.ui.main.MainActivity
 import eu.kanade.tachiyomi.ui.manga.MangaController
+import eu.kanade.tachiyomi.ui.migration.MigrationController
 import eu.kanade.tachiyomi.util.inflate
 import eu.kanade.tachiyomi.util.toast
-import eu.kanade.tachiyomi.widget.DrawerSwipeCloseListener
-import exh.metadata.loadAllMetadata
-import exh.metadata.models.SearchableGalleryMetadata
-import io.realm.Realm
-import io.realm.RealmResults
-import kotlinx.android.synthetic.main.main_activity.*
+import exh.favorites.FavoritesIntroDialog
+import exh.favorites.FavoritesSyncStatus
+import exh.ui.LoaderManager
 import kotlinx.android.synthetic.main.library_controller.*
 import kotlinx.android.synthetic.main.main_activity.*
 import rx.Subscription
@@ -49,7 +48,6 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.IOException
 import java.util.concurrent.TimeUnit
-import kotlin.reflect.KClass
 
 
 class LibraryController(
@@ -81,7 +79,7 @@ class LibraryController(
     /**
      * Currently selected mangas.
      */
-    val selectedMangas = mutableListOf<Manga>()
+    val selectedMangas = mutableSetOf<Manga>()
 
     private var selectedCoverManga: Manga? = null
 
@@ -125,11 +123,16 @@ class LibraryController(
 
     private var tabsVisibilitySubscription: Subscription? = null
 
+    private var searchViewSubscription: Subscription? = null
+
     // --> EH
-    //Cached realm
-    var realm: Realm? = null
-    //Cached metadata
-    var meta: Map<KClass<out SearchableGalleryMetadata>, RealmResults<out SearchableGalleryMetadata>>? = null
+    //Sync dialog
+    private var favSyncDialog: MaterialDialog? = null
+    //Old sync status
+    private var oldSyncStatus: FavoritesSyncStatus? = null
+    //Favorites
+    private var favoritesSyncSubscription: Subscription? = null
+    val loaderManager = LoaderManager()
     // <-- EH
 
     init {
@@ -148,16 +151,6 @@ class LibraryController(
     override fun inflateView(inflater: LayoutInflater, container: ViewGroup): View {
         return inflater.inflate(R.layout.library_controller, container, false)
     }
-
-    // --> EH
-    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup, savedViewState: Bundle?): View {
-        //Load realm
-        realm = Realm.getDefaultInstance()?.apply {
-            meta = loadAllMetadata()
-        }
-        return super.onCreateView(inflater, container, savedViewState)
-    }
-    // <-- EH
 
     override fun onViewCreated(view: View) {
         super.onViewCreated(view)
@@ -178,6 +171,12 @@ class LibraryController(
         if (selectedMangas.isNotEmpty()) {
             createActionModeIfNeeded()
         }
+
+        // EXH -->
+        loaderManager.loadingChangeListener = {
+            library_progress.visibility = if(it) View.VISIBLE else View.GONE
+        }
+        // EXH <--
     }
 
     override fun onChangeStarted(handler: ControllerChangeHandler, type: ControllerChangeType) {
@@ -194,22 +193,16 @@ class LibraryController(
         actionMode = null
         tabsVisibilitySubscription?.unsubscribe()
         tabsVisibilitySubscription = null
+        // EXH -->
+        loaderManager.loadingChangeListener = null
+        // EXH <--
         super.onDestroyView(view)
-
-        // --> EH
-        //Clean up realm
-        realm?.close()
-        meta = null
-        // <-- EH
     }
 
     override fun createSecondaryDrawer(drawer: DrawerLayout): ViewGroup {
         val view = drawer.inflate(R.layout.library_drawer) as LibraryNavigationView
-        drawerListener = DrawerSwipeCloseListener(drawer, view).also {
-            drawer.addDrawerListener(it)
-        }
         navView = view
-        drawer.setDrawerLockMode(DrawerLayout.LOCK_MODE_LOCKED_CLOSED, Gravity.END)
+        drawer.setDrawerLockMode(DrawerLayout.LOCK_MODE_UNLOCKED, Gravity.END)
 
         navView?.onGroupClicked = { group ->
             when (group) {
@@ -224,8 +217,6 @@ class LibraryController(
     }
 
     override fun cleanupSecondaryDrawer(drawer: DrawerLayout) {
-        drawerListener?.let { drawer.removeDrawerListener(it) }
-        drawerListener = null
         navView = null
     }
 
@@ -306,7 +297,7 @@ class LibraryController(
         activity?.invalidateOptionsMenu()
     }
 
-    private fun onDownloadBadgeChanged(){
+    private fun onDownloadBadgeChanged() {
         presenter.requestDownloadBadgesUpdate()
     }
 
@@ -362,14 +353,14 @@ class LibraryController(
         // Mutate the filter icon because it needs to be tinted and the resource is shared.
         menu.findItem(R.id.action_filter).icon.mutate()
 
-        // Debounce search (EH)
-        searchView.queryTextChanges()
-                .debounce(350, TimeUnit.MILLISECONDS)
-                .observeOn(AndroidSchedulers.mainThread())
+        searchViewSubscription?.unsubscribe()
+        searchViewSubscription = searchView.queryTextChanges()
+                // Ignore events if this controller isn't at the top
+                .filter { router.backstack.lastOrNull()?.controller() == this }
                 .subscribeUntilDestroy {
-            query = it.toString()
-            searchRelay.call(query)
-        }
+                    query = it.toString()
+                    searchRelay.call(query)
+                }
 
         searchItem.fixExpand()
     }
@@ -395,6 +386,17 @@ class LibraryController(
             R.id.action_edit_categories -> {
                 router.pushController(CategoryController().withFadeTransaction())
             }
+            R.id.action_source_migration -> {
+                router.pushController(MigrationController().withFadeTransaction())
+            }
+            // --> EXH
+            R.id.action_sync_favorites -> {
+                if(preferences.eh_showSyncIntro().getOrDefault())
+                    activity?.let { FavoritesIntroDialog().show(it) }
+                else
+                    presenter.favoritesSync.runSync()
+            }
+            // <-- EXH
             else -> return super.onOptionsItemSelected(item)
         }
 
@@ -460,11 +462,13 @@ class LibraryController(
      */
     fun setSelection(manga: Manga, selected: Boolean) {
         if (selected) {
-            selectedMangas.add(manga)
-            selectionRelay.call(LibrarySelectionEvent.Selected(manga))
+            if (selectedMangas.add(manga)) {
+                selectionRelay.call(LibrarySelectionEvent.Selected(manga))
+            }
         } else {
-            selectedMangas.remove(manga)
-            selectionRelay.call(LibrarySelectionEvent.Unselected(manga))
+            if (selectedMangas.remove(manga)) {
+                selectionRelay.call(LibrarySelectionEvent.Unselected(manga))
+            }
         }
     }
 
@@ -517,6 +521,132 @@ class LibraryController(
             activity?.toast(R.string.notification_first_add_to_library)
         }
     }
+
+    override fun onAttach(view: View) {
+        super.onAttach(view)
+
+        // --> EXH
+        cleanupSyncState()
+        favoritesSyncSubscription =
+                presenter.favoritesSync.status
+                        .sample(100, TimeUnit.MILLISECONDS)
+                        .observeOn(AndroidSchedulers.mainThread())
+                        .subscribe {
+                    updateSyncStatus(it)
+        }
+        // <-- EXH
+    }
+
+    override fun onDetach(view: View) {
+        super.onDetach(view)
+
+        //EXH
+        cleanupSyncState()
+    }
+
+    // --> EXH
+    private fun cleanupSyncState() {
+        favoritesSyncSubscription?.unsubscribe()
+        favoritesSyncSubscription = null
+        //Close sync status
+        favSyncDialog?.dismiss()
+        favSyncDialog = null
+        oldSyncStatus = null
+        //Clear flags
+        releaseSyncLocks()
+    }
+
+    private fun buildDialog() = activity?.let {
+        MaterialDialog.Builder(it)
+    }
+
+    private fun showSyncProgressDialog() {
+        favSyncDialog?.dismiss()
+        favSyncDialog = buildDialog()
+                ?.title("Favorites syncing")
+                ?.cancelable(false)
+                ?.progress(true, 0)
+                ?.show()
+    }
+
+    private fun takeSyncLocks() {
+        activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    private fun releaseSyncLocks() {
+        activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    private fun updateSyncStatus(status: FavoritesSyncStatus) {
+        when(status) {
+            is FavoritesSyncStatus.Idle -> {
+                releaseSyncLocks()
+
+                favSyncDialog?.dismiss()
+                favSyncDialog = null
+            }
+            is FavoritesSyncStatus.BadLibraryState.MangaInMultipleCategories -> {
+                releaseSyncLocks()
+
+                favSyncDialog?.dismiss()
+                favSyncDialog = buildDialog()
+                        ?.title("Favorites sync error")
+                        ?.content(status.message + " Sync will not start until the gallery is in only one category.")
+                        ?.cancelable(false)
+                        ?.positiveText("Show gallery")
+                        ?.onPositive { _, _ ->
+                            openManga(status.manga)
+                            presenter.favoritesSync.status.onNext(FavoritesSyncStatus.Idle())
+                        }
+                        ?.negativeText("Ok")
+                        ?.onNegative { _, _ ->
+                            presenter.favoritesSync.status.onNext(FavoritesSyncStatus.Idle())
+                        }
+                        ?.show()
+            }
+            is FavoritesSyncStatus.Error -> {
+                releaseSyncLocks()
+
+                favSyncDialog?.dismiss()
+                favSyncDialog = buildDialog()
+                        ?.title("Favorites sync error")
+                        ?.content("An error occurred during the sync process: ${status.message}")
+                        ?.cancelable(false)
+                        ?.positiveText("Ok")
+                        ?.onPositive { _, _ ->
+                            presenter.favoritesSync.status.onNext(FavoritesSyncStatus.Idle())
+                        }
+                        ?.show()
+            }
+            is FavoritesSyncStatus.CompleteWithErrors -> {
+                releaseSyncLocks()
+
+                favSyncDialog?.dismiss()
+                favSyncDialog = buildDialog()
+                        ?.title("Favorites sync complete with errors")
+                        ?.content("Errors occurred during the sync process that were ignored:\n${status.message}")
+                        ?.cancelable(false)
+                        ?.positiveText("Ok")
+                        ?.onPositive { _, _ ->
+                            presenter.favoritesSync.status.onNext(FavoritesSyncStatus.Idle())
+                        }
+                        ?.show()
+            }
+            is FavoritesSyncStatus.Processing,
+            is FavoritesSyncStatus.Initializing -> {
+                takeSyncLocks()
+
+                if(favSyncDialog == null || (oldSyncStatus != null
+                        && oldSyncStatus !is FavoritesSyncStatus.Initializing
+                        && oldSyncStatus !is FavoritesSyncStatus.Processing))
+                    showSyncProgressDialog()
+
+                favSyncDialog?.setContent(status.message)
+            }
+        }
+        oldSyncStatus = status
+    }
+    // <-- EXH
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         if (requestCode == REQUEST_IMAGE_OPEN) {

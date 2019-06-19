@@ -49,13 +49,21 @@ fun syncChaptersWithSource(db: DatabaseHelper,
         // Add the chapter if not in db already, or update if the metadata changed.
         if (dbChapter == null) {
             toAdd.add(sourceChapter)
-        } else if (dbChapter.scanlator != sourceChapter.scanlator ||
-                dbChapter.name != sourceChapter.name) {
+        } else {
+            //this forces metadata update for the main viewable things in the chapter list
+            if (source is HttpSource) {
+                source.prepareNewChapter(sourceChapter, manga)
+            }
 
-            dbChapter.scanlator = sourceChapter.scanlator
-            dbChapter.name = sourceChapter.name
+            ChapterRecognition.parseChapterNumber(sourceChapter, manga)
 
-            toChange.add(dbChapter)
+            if (shouldUpdateDbChapter(dbChapter, sourceChapter)) {
+                dbChapter.scanlator = sourceChapter.scanlator
+                dbChapter.name = sourceChapter.name
+                dbChapter.date_upload = sourceChapter.date_upload
+                dbChapter.chapter_number = sourceChapter.chapter_number
+                toChange.add(dbChapter)
+            }
         }
     }
 
@@ -119,7 +127,18 @@ fun syncChaptersWithSource(db: DatabaseHelper,
 
         // Fix order in source.
         db.fixChaptersSourceOrder(sourceChapters).executeAsBlocking()
+
+        // Set this manga as updated since chapters were changed
+        manga.last_update = Date().time
+        db.updateLastUpdated(manga).executeAsBlocking()
     }
     return Pair(toAdd.subtract(readded).toList(), toDelete.subtract(readded).toList())
 
+}
+
+//checks if the chapter in db needs updated
+private fun shouldUpdateDbChapter(dbChapter: Chapter, sourceChapter: SChapter): Boolean {
+    return dbChapter.scanlator != sourceChapter.scanlator || dbChapter.name != sourceChapter.name ||
+            dbChapter.date_upload != sourceChapter.date_upload ||
+            dbChapter.chapter_number != sourceChapter.chapter_number
 }

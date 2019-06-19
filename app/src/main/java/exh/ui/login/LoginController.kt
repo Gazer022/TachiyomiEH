@@ -9,12 +9,18 @@ import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.afollestad.materialdialogs.MaterialDialog
+import com.jakewharton.rxbinding.view.clicks
 import eu.kanade.tachiyomi.R
 import eu.kanade.tachiyomi.data.preference.PreferencesHelper
 import eu.kanade.tachiyomi.source.SourceManager
 import eu.kanade.tachiyomi.source.online.all.EHentai
 import eu.kanade.tachiyomi.ui.base.controller.NucleusController
+import eu.kanade.tachiyomi.util.gone
+import eu.kanade.tachiyomi.util.invisible
+import eu.kanade.tachiyomi.util.launchUI
+import eu.kanade.tachiyomi.util.visible
 import exh.EXH_SOURCE_ID
+import exh.uconfig.WarnConfigureDialogController
 import kotlinx.android.synthetic.main.eh_activity_login.view.*
 import rx.Observable
 import rx.android.schedulers.AndroidSchedulers
@@ -44,18 +50,54 @@ class LoginController : NucleusController<LoginPresenter>() {
 
         with(view) {
             btn_cancel.setOnClickListener { router.popCurrentController() }
-            btn_recheck.setOnClickListener { webview.loadUrl("http://exhentai.org/") }
+
+            btn_advanced.setOnClickListener {
+                advanced_options.visible()
+                adv_shim.visible()
+                webview.gone()
+                btn_advanced.isEnabled = false
+                btn_cancel.isEnabled = false
+            }
+
+            btn_close.setOnClickListener {
+                hideAdvancedOptions(this)
+            }
+
+            btn_recheck.setOnClickListener {
+                hideAdvancedOptions(this)
+                webview.loadUrl("https://exhentai.org/")
+            }
+
+            btn_alt_login.setOnClickListener {
+                hideAdvancedOptions(this)
+                webview.loadUrl("https://e-hentai.org/bounce_login.php")
+            }
+
+            btn_skip_restyle.setOnClickListener {
+                hideAdvancedOptions(this)
+                webview.loadUrl("https://forums.e-hentai.org/index.php?act=Login&$PARAM_SKIP_INJECT=true")
+            }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                 CookieManager.getInstance().removeAllCookies {
-                    Observable.fromCallable {
+                    launchUI {
                         startWebview(view)
-                    }.subscribeOn(AndroidSchedulers.mainThread()).subscribe()
+                    }
                 }
             } else {
                 CookieManager.getInstance().removeAllCookie()
                 startWebview(view)
             }
+        }
+    }
+
+    private fun hideAdvancedOptions(view: View) {
+        with(view) {
+            advanced_options.gone()
+            adv_shim.gone()
+            webview.visible()
+            btn_advanced.isEnabled = true
+            btn_cancel.isEnabled = true
         }
     }
 
@@ -66,18 +108,19 @@ class LoginController : NucleusController<LoginPresenter>() {
 
             webview.loadUrl("https://forums.e-hentai.org/index.php?act=Login")
 
-            webview.setWebViewClient(object : WebViewClient() {
+            webview.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView, url: String) {
                     super.onPageFinished(view, url)
                     Timber.d(url)
                     val parsedUrl = Uri.parse(url)
                     if (parsedUrl.host.equals("forums.e-hentai.org", ignoreCase = true)) {
                         //Hide distracting content
-                        view.loadUrl(HIDE_JS)
+                        if(!parsedUrl.queryParameterNames.contains(PARAM_SKIP_INJECT))
+                            view.loadUrl(HIDE_JS)
 
                         //Check login result
                         if (parsedUrl.getQueryParameter("code")?.toInt() != 0) {
-                            if (checkLoginCookies(url)) view.loadUrl("http://exhentai.org/")
+                            if (checkLoginCookies(url)) view.loadUrl("https://exhentai.org/")
                         }
                     } else if (parsedUrl.host.equals("exhentai.org", ignoreCase = true)) {
                         //At ExHentai, check that everything worked out...
@@ -87,7 +130,7 @@ class LoginController : NucleusController<LoginPresenter>() {
                         }
                     }
                 }
-            })
+            }
         }
     }
 
@@ -102,6 +145,7 @@ class LoginController : NucleusController<LoginPresenter>() {
         val eh = sourceManager
                 .getOnlineSources()
                 .find { it.id == EXH_SOURCE_ID } as EHentai
+
         Observable.fromCallable {
             //I honestly have no idea why we need to call this twice, but it works, so whatever
             try {
@@ -115,6 +159,9 @@ class LoginController : NucleusController<LoginPresenter>() {
                 .subscribe {
                     progressDialog.dismiss()
                     router.popCurrentController()
+
+                    //Upload settings
+                    WarnConfigureDialogController.uploadSettings(router)
                 }
     }
 
@@ -171,6 +218,8 @@ class LoginController : NucleusController<LoginPresenter>() {
     }
 
     companion object {
+        const val PARAM_SKIP_INJECT = "TEH_SKIP_INJECT"
+
         const val MEMBER_ID_COOKIE = "ipb_member_id"
         const val PASS_HASH_COOKIE = "ipb_pass_hash"
         const val IGNEOUS_COOKIE = "igneous"
